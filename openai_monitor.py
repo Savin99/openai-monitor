@@ -69,6 +69,34 @@ def get_costs_for_period(start_ts, end_ts=None):
     return round(total, 2)
 
 
+def get_billing_balance():
+    """Try to get real balance from OpenAI billing API.
+
+    Returns (total_granted, total_used, remaining) or None if unavailable.
+    """
+    url = "https://api.openai.com/v1/dashboard/billing/credit_grants"
+    headers = {
+        "Authorization": f"Bearer {CONFIG['openai_admin_key']}",
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        total_granted = data.get("total_granted")
+        total_used = data.get("total_used")
+        if total_granted is not None and total_used is not None:
+            remaining = round(float(total_granted) - float(total_used), 2)
+            return {
+                "total_granted": round(float(total_granted), 2),
+                "total_used": round(float(total_used), 2),
+                "remaining": remaining,
+            }
+    except (requests.RequestException, ValueError, KeyError) as e:
+        log.debug(f"Billing API unavailable: {e}")
+    return None
+
+
 def get_total_costs():
     """Get total costs from OpenAI API for 2026."""
     # Start from Jan 1, 2026
@@ -214,13 +242,21 @@ def get_status_message():
 
     today_spent = get_today_costs()
     state = load_state()
-    total_deposited = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
     threshold = state.get("alert_threshold", CONFIG["alert_threshold"])
-    remaining = round(total_deposited - total_spent, 2)
+
+    billing = get_billing_balance()
+    if billing:
+        total_deposited = billing["total_granted"]
+        remaining = billing["remaining"]
+        source = "авто"
+    else:
+        total_deposited = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
+        remaining = round(total_deposited - total_spent, 2)
+        source = "ручной"
 
     return (
         f"<b>OpenAI API — Статус</b>\n\n"
-        f"Остаток: <b>${remaining}</b>\n"
+        f"Остаток: <b>${remaining}</b> ({source})\n"
         f"Потрачено сегодня: ${today_spent}\n"
         f"Потрачено за 2026: ${total_spent}\n"
         f"Всего внесено: ${total_deposited}\n"
@@ -688,24 +724,31 @@ def check_and_alert():
         return
 
     state = load_state()
-    total_deposited = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
     threshold = state.get("alert_threshold", CONFIG["alert_threshold"])
 
     print("OpenAI Spending Monitor")
     print("=" * 40)
 
-    print("Fetching costs from OpenAI API...")
-    total_spent = get_total_costs()
-
-    if total_spent is None:
-        print("Failed to fetch costs")
-        return
+    billing = get_billing_balance()
+    if billing:
+        total_deposited = billing["total_granted"]
+        total_spent = billing["total_used"]
+        remaining = billing["remaining"]
+        print("Balance source: auto (billing API)")
+    else:
+        print("Billing API unavailable, using manual mode")
+        total_deposited = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
+        print("Fetching costs from OpenAI API...")
+        total_spent = get_total_costs()
+        if total_spent is None:
+            print("Failed to fetch costs")
+            return
+        remaining = round(total_deposited - total_spent, 2)
 
     today_spent = get_today_costs()
-    remaining = round(total_deposited - total_spent, 2)
 
     print(f"\nTotal deposited: ${total_deposited}")
-    print(f"Total spent (2026): ${total_spent}")
+    print(f"Total spent: ${total_spent}")
     print(f"Today spent: ${today_spent}")
     print(f"Remaining balance: ${remaining}")
     print(f"Alert threshold: ${threshold}")
