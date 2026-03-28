@@ -712,18 +712,24 @@ def check_and_alert():
 
     today = datetime.now().strftime("%Y-%m-%d")
 
+    alert_step = state.get("alert_step", 10)
+
     if remaining <= threshold:
         print(f"\n[!] Balance below threshold!")
 
-        last_balance = state.get("last_balance")
-        balance_changed = last_balance is None or abs(last_balance - remaining) > 0.01
-        if state.get("last_alert_date") != today or balance_changed:
+        last_alert_level = state.get("last_alert_level")
+        # Current alert level: round down to nearest alert_step
+        current_level = int(remaining // alert_step) * alert_step
+
+        if last_alert_level is None or current_level < last_alert_level:
+            spent_since_threshold = round(threshold - remaining, 2)
             message = (
                 f"🚨 <b>OpenAI API — Алерт</b>\n\n"
                 f"Остаток: <b>${remaining}</b>\n"
                 f"Потрачено сегодня: ${today_spent}\n"
                 f"Потрачено за 2026: ${total_spent}\n\n"
                 f"Порог: ${threshold}\n"
+                f"С момента алерта: <b>-${spent_since_threshold}</b>\n"
                 f"<b>Нужно пополнить!</b>"
             )
 
@@ -731,11 +737,16 @@ def check_and_alert():
                 print("Telegram alert sent!")
                 state["last_alert_date"] = today
                 state["last_balance"] = remaining
+                state["last_alert_level"] = current_level
                 save_state(state)
             else:
                 print("Failed to send Telegram alert")
     else:
         print(f"\n[OK] Balance above threshold")
+        # Reset alert level when balance is topped up above threshold
+        if "last_alert_level" in state:
+            del state["last_alert_level"]
+            save_state(state)
 
     return remaining
 
