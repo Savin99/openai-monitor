@@ -21,6 +21,8 @@ CONFIG = {
     "alert_threshold": 100,  # USD
 }
 
+log = logging.getLogger("openai-monitor")
+
 # State file to track last alert and total_deposited
 STATE_FILE = Path(__file__).parent / "monitor_state.json"
 DEFAULT_TOTAL_DEPOSITED = 2408.71
@@ -44,8 +46,12 @@ def get_costs_for_period(start_ts, end_ts=None):
         if next_page:
             params["page"] = next_page
 
-        response = requests.get(url, headers=headers, params=params)
-        data = response.json()
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+            data = response.json()
+        except requests.RequestException as e:
+            print(f"Error fetching costs: {e}")
+            return None
 
         if "error" in data:
             print(f"Error: {data['error']}")
@@ -145,8 +151,8 @@ def get_last_months_costs(num_months=3):
     return months
 
 
-def send_telegram_alert(message):
-    """Send alert to Telegram."""
+def send_telegram_alert(message, max_retries=3):
+    """Send alert to Telegram with retries."""
     url = f"https://api.telegram.org/bot{CONFIG['telegram_bot_token']}/sendMessage"
     payload = {
         "chat_id": CONFIG["telegram_chat_id"],
@@ -154,8 +160,20 @@ def send_telegram_alert(message):
         "parse_mode": "HTML"
     }
 
-    response = requests.post(url, json=payload)
-    return response.status_code == 200
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, json=payload, timeout=10)
+            data = response.json()
+            if response.status_code == 200 and data.get("ok"):
+                return True
+            log.error(f"Telegram API error (attempt {attempt + 1}): {data.get('description', response.status_code)}")
+        except requests.RequestException as e:
+            log.error(f"Telegram request failed (attempt {attempt + 1}): {e}")
+
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)
+
+    return False
 
 
 def load_state():
@@ -697,7 +715,9 @@ def check_and_alert():
     if remaining <= threshold:
         print(f"\n[!] Balance below threshold!")
 
-        if state.get("last_alert_date") != today or state.get("last_balance") != remaining:
+        last_balance = state.get("last_balance")
+        balance_changed = last_balance is None or abs(last_balance - remaining) > 0.01
+        if state.get("last_alert_date") != today or balance_changed:
             message = (
                 f"🚨 <b>OpenAI API — Алерт</b>\n\n"
                 f"Остаток: <b>${remaining}</b>\n"
