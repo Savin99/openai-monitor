@@ -28,7 +28,7 @@ STATE_FILE = Path(__file__).parent / "monitor_state.json"
 DEFAULT_TOTAL_DEPOSITED = 2408.71
 
 
-def get_costs_for_period(start_ts, end_ts=None):
+def get_costs_for_period(start_ts, end_ts=None, max_retries=3):
     """Get costs from OpenAI API for a specific period.
 
     Returns (cost_float, None) on success, or (None, error_string) on failure.
@@ -41,6 +41,7 @@ def get_costs_for_period(start_ts, end_ts=None):
 
     total = 0.0
     next_page = None
+    last_err = None
 
     while True:
         params = {"start_time": start_ts, "limit": 100}
@@ -49,21 +50,29 @@ def get_costs_for_period(start_ts, end_ts=None):
         if next_page:
             params["page"] = next_page
 
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-            if response.status_code != 200:
-                err = f"HTTP {response.status_code}: {response.text[:200]}"
-                log.error("OpenAI costs API: %s", err)
-                return None, err
-            data = response.json()
-        except requests.RequestException as e:
-            err = f"Ошибка сети: {e}"
-            log.error("Error fetching costs: %s", e)
-            return None, err
-        except (ValueError, KeyError) as e:
-            err = f"Ошибка парсинга ответа: {e}"
-            log.error("Error parsing costs response: %s", e)
-            return None, err
+        data = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=30)
+                if response.status_code != 200:
+                    last_err = f"HTTP {response.status_code}: {response.text[:200]}"
+                    log.error("OpenAI costs API (attempt %d): %s", attempt + 1, last_err)
+                else:
+                    data = response.json()
+                    break
+            except requests.RequestException as e:
+                last_err = f"Ошибка сети: {e}"
+                log.error("Error fetching costs (attempt %d): %s", attempt + 1, e)
+            except (ValueError, KeyError) as e:
+                last_err = f"Ошибка парсинга ответа: {e}"
+                log.error("Error parsing costs response: %s", e)
+                return None, last_err
+
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+
+        if data is None:
+            return None, last_err
 
         if "error" in data:
             err = f"API error: {data['error']}"
