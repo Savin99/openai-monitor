@@ -48,13 +48,16 @@ def get_costs_for_period(start_ts, end_ts=None):
 
         try:
             response = requests.get(url, headers=headers, params=params, timeout=15)
+            if response.status_code != 200:
+                log.error("OpenAI costs API returned HTTP %s: %s", response.status_code, response.text[:500])
+                return None
             data = response.json()
-        except requests.RequestException as e:
-            print(f"Error fetching costs: {e}")
+        except (requests.RequestException, ValueError, KeyError) as e:
+            log.error("Error fetching costs: %s", e)
             return None
 
         if "error" in data:
-            print(f"Error: {data['error']}")
+            log.error("OpenAI costs API error response: %s", data["error"])
             return None
 
         for bucket in data.get("data", []):
