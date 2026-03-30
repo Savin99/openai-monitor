@@ -29,7 +29,10 @@ DEFAULT_TOTAL_DEPOSITED = 2408.71
 
 
 def get_costs_for_period(start_ts, end_ts=None):
-    """Get costs from OpenAI API for a specific period."""
+    """Get costs from OpenAI API for a specific period.
+
+    Returns (cost_float, None) on success, or (None, error_string) on failure.
+    """
     url = "https://api.openai.com/v1/organization/costs"
     headers = {
         "Authorization": f"Bearer {CONFIG['openai_admin_key']}",
@@ -49,16 +52,23 @@ def get_costs_for_period(start_ts, end_ts=None):
         try:
             response = requests.get(url, headers=headers, params=params, timeout=15)
             if response.status_code != 200:
-                log.error("OpenAI costs API returned HTTP %s: %s", response.status_code, response.text[:500])
-                return None
+                err = f"HTTP {response.status_code}: {response.text[:200]}"
+                log.error("OpenAI costs API: %s", err)
+                return None, err
             data = response.json()
-        except (requests.RequestException, ValueError, KeyError) as e:
+        except requests.RequestException as e:
+            err = f"Ошибка сети: {e}"
             log.error("Error fetching costs: %s", e)
-            return None
+            return None, err
+        except (ValueError, KeyError) as e:
+            err = f"Ошибка парсинга ответа: {e}"
+            log.error("Error parsing costs response: %s", e)
+            return None, err
 
         if "error" in data:
+            err = f"API error: {data['error']}"
             log.error("OpenAI costs API error response: %s", data["error"])
-            return None
+            return None, err
 
         for bucket in data.get("data", []):
             for result in bucket.get("results", []):
@@ -69,7 +79,7 @@ def get_costs_for_period(start_ts, end_ts=None):
             break
         next_page = data.get("next_page")
 
-    return round(total, 2)
+    return round(total, 2), None
 
 
 def get_billing_balance():
@@ -101,17 +111,20 @@ def get_billing_balance():
 
 
 def get_total_costs():
-    """Get total costs from OpenAI API for 2026."""
-    # Start from Jan 1, 2026
-    start_time = 1767225600
+    """Get total costs from OpenAI API for 2026.
+
+    Returns (cost, error_string_or_None).
+    """
+    start_time = 1767225600  # Jan 1, 2026
     return get_costs_for_period(start_time)
 
 
 def get_today_costs():
-    """Get today's costs."""
+    """Get today's costs. Returns cost float or None."""
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start_time = int(today.timestamp())
-    return get_costs_for_period(start_time)
+    cost, _err = get_costs_for_period(start_time)
+    return cost
 
 
 def get_week_costs():
@@ -119,14 +132,16 @@ def get_week_costs():
     now = datetime.now(timezone.utc)
     monday = now - timedelta(days=now.weekday())
     monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    return get_costs_for_period(int(monday.timestamp()))
+    cost, _err = get_costs_for_period(int(monday.timestamp()))
+    return cost
 
 
 def get_month_costs():
     """Get current month's costs."""
     now = datetime.now(timezone.utc)
     first_day = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return get_costs_for_period(int(first_day.timestamp()))
+    cost, _err = get_costs_for_period(int(first_day.timestamp()))
+    return cost
 
 
 def get_last_weeks_costs(num_weeks=4):
@@ -142,7 +157,7 @@ def get_last_weeks_costs(num_weeks=4):
         # Calculate week end (Sunday)
         week_end = week_start + timedelta(days=7)
 
-        cost = get_costs_for_period(int(week_start.timestamp()), int(week_end.timestamp()))
+        cost, _err = get_costs_for_period(int(week_start.timestamp()), int(week_end.timestamp()))
         weeks.append({
             "start": week_start,
             "end": week_end,
@@ -173,7 +188,7 @@ def get_last_months_costs(num_months=3):
         else:
             next_month = datetime(year, month + 1, 1, tzinfo=timezone.utc)
 
-        cost = get_costs_for_period(int(first_day.timestamp()), int(next_month.timestamp()))
+        cost, _err = get_costs_for_period(int(first_day.timestamp()), int(next_month.timestamp()))
         months.append({
             "month": first_day,
             "cost": cost or 0
@@ -239,32 +254,40 @@ def topup(amount):
 
 def get_status_message():
     """Build status message with current balance info."""
-    total_spent = get_total_costs()
-    if total_spent is None:
-        return "Не удалось получить данные от OpenAI API."
-
-    today_spent = get_today_costs()
+    total_spent, costs_err = get_total_costs()
     state = load_state()
     threshold = state.get("alert_threshold", CONFIG["alert_threshold"])
 
     billing = get_billing_balance()
+
+    if total_spent is None and billing is None:
+        return (
+            f"Не удалось получить данные от OpenAI API.\n\n"
+            f"<b>Ошибка:</b> <code>{costs_err}</code>"
+        )
+
     if billing:
         total_deposited = billing["total_granted"]
         remaining = billing["remaining"]
         source = "авто"
     else:
         total_deposited = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
-        remaining = round(total_deposited - total_spent, 2)
+        remaining = round(total_deposited - (total_spent or 0), 2)
         source = "ручной"
 
-    return (
-        f"<b>OpenAI API — Статус</b>\n\n"
-        f"Остаток: <b>${remaining}</b> ({source})\n"
-        f"Потрачено сегодня: ${today_spent}\n"
-        f"Потрачено за 2026: ${total_spent}\n"
-        f"Всего внесено: ${total_deposited}\n"
-        f"Порог алерта: ${threshold}"
-    )
+    today_spent = get_today_costs()
+
+    lines = [f"<b>OpenAI API — Статус</b>\n"]
+    lines.append(f"Остаток: <b>${remaining}</b> ({source})")
+    lines.append(f"Потрачено сегодня: ${today_spent or '?'}")
+    lines.append(f"Потрачено за 2026: ${total_spent or '?'}")
+    lines.append(f"Всего внесено: ${total_deposited}")
+    lines.append(f"Порог алерта: ${threshold}")
+
+    if costs_err:
+        lines.append(f"\n⚠️ Costs API: <code>{costs_err}</code>")
+
+    return "\n".join(lines)
 
 
 def get_week_report():
@@ -742,9 +765,9 @@ def check_and_alert():
         print("Billing API unavailable, using manual mode")
         total_deposited = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
         print("Fetching costs from OpenAI API...")
-        total_spent = get_total_costs()
+        total_spent, costs_err = get_total_costs()
         if total_spent is None:
-            print("Failed to fetch costs")
+            print(f"Failed to fetch costs: {costs_err}")
             return
         remaining = round(total_deposited - total_spent, 2)
 
