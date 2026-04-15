@@ -723,8 +723,22 @@ def run_bot():
     state = load_state()
     offset = state.get("bot_offset")
 
+    # Periodic balance check (every hour)
+    check_interval = 3600
+    last_check = 0
+
     while True:
         try:
+            # Auto balance check every hour
+            now = time.time()
+            if now - last_check >= check_interval:
+                log.info("Running periodic balance check...")
+                try:
+                    check_and_alert()
+                except Exception as e:
+                    log.error(f"Periodic check failed: {e}")
+                last_check = now
+
             url = f"https://api.telegram.org/bot{CONFIG['telegram_bot_token']}/getUpdates"
             params = {"timeout": 30}
             if offset:
