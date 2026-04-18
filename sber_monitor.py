@@ -436,30 +436,47 @@ def check_and_alert(force_refresh=False):
 
 
 FINAL_WARNING_ART = r"""
-             .---.
-            /o o o\
-            \  -  /
-             '---'
-            __|_|__
-           /       \
-          /  R.I.P  \
-         /           \
-        |  твой       |
-        |  депозит    |
-        |  2026       |
-        |             |
-        |  "почти     |
-        |   успел"    |
-    ____|_____________|____
-   ////|             |\\\\
+                    _
+                   | |
+                   | |
+               +---+-+---+
+                   | |
+             ______|_|______
+            /               \
+           /                 \
+          /                   \
+         |     ___________     |
+         |    /           \    |
+         |   |    .---.    |   |
+         |   |   / o o \   |   |
+         |   |  |   V   |  |   |
+         |   |   \ --- /   |   |
+         |   |   /|||||\   |   |
+         |    \_/|||||\_/      |
+         |      '-----'        |
+         |                     |
+         |    R .  I .  P .    |
+         |                     |
+         |  ~ ~ ~ ~ ~ ~ ~ ~ ~  |
+         |                     |
+         |    Твой  Депозит    |
+         |      2026 — ???     |
+         |                     |
+         |    почти  успел     |
+         |_____________________|
+    ____/|                     |\____
+   /     |_____________________|     \
+  /_________________________________\
+ . * . * . * . * . * . * . * . * . * .
 """
 
 
 def send_final_warning():
     """Send a dramatic last-call ping if any RC account is still above threshold.
 
-    Designed to fire at ~20:00 MSK — 4 hours before the alert window ends —
-    as a heavier-handed nudge than the hourly alert. Silent if balances are fine.
+    Fires at ~19:55 MSK on weekdays only. At most once per day; subsequent runs
+    that day stay silent. Weekend = silent (exchange closed, can't move money
+    to a deposit anyway). Silent if balances are already fine.
     """
     missing = [
         k for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
@@ -469,11 +486,24 @@ def send_final_warning():
         print("Missing env vars: " + ", ".join(missing))
         return
 
+    now = now_in_alert_tz()
+
+    # weekend: exchange is closed, nothing to do
+    if now.weekday() >= 5:
+        print(f"Final warning skipped — weekend ({now.strftime('%A')})")
+        return
+
+    today_str = now.strftime("%Y-%m-%d")
+    sber_state = get_sber_state()
+    if sber_state.get("last_final_warning_date") == today_str:
+        print(f"Final warning already sent today ({today_str}), skip")
+        return
+
     access_token, tokens = get_valid_access_token()
     check_refresh_token_expiry(tokens)
     raw_accounts = get_client_accounts(access_token)
     accounts = filter_rub_current_accounts(raw_accounts)
-    statement_date = now_in_alert_tz().strftime("%Y-%m-%d")
+    statement_date = today_str
     accounts = enrich_with_balances(access_token, accounts, statement_date)
 
     threshold = CONFIG["balance_threshold"]
@@ -490,7 +520,6 @@ def send_final_warning():
         balance_str = f"{a['balance']:,.2f}".replace(",", " ")
         above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>")
 
-    now = now_in_alert_tz()
     hours_left = max(0, CONFIG["alert_hour_end"] + 1 - now.hour)
 
     message = (
@@ -506,6 +535,8 @@ def send_final_warning():
     )
     if _alert(message):
         print(f"Final warning sent at {now.strftime('%Y-%m-%dT%H:%M')}")
+        sber_state["last_final_warning_date"] = today_str
+        save_sber_state(sber_state)
     else:
         print("Failed to send final warning")
 
