@@ -17,6 +17,7 @@ from utils import (
     send_telegram_alert as _send_telegram_alert_raw,
     send_telegram_document as _send_telegram_document_raw,
     send_telegram_photo as _send_telegram_photo_raw,
+    touch_heartbeat,
 )
 
 # Configuration — secrets from environment variables
@@ -1092,12 +1093,17 @@ def backup_state():
 
 
 def main():
+    # heartbeat is only reached when the subcommand completes without
+    # sys.exit(1). That makes "last successful run" visible to the watchdog.
     if len(sys.argv) >= 2 and sys.argv[1] == "--bot":
         run_bot()
+        # run_bot is a long-running loop — don't expect to touch heartbeat here
     elif len(sys.argv) >= 2 and sys.argv[1] == "--status":
         send_status_report()
+        touch_heartbeat("openai-monitor-status")
     elif len(sys.argv) >= 2 and sys.argv[1] == "--backup":
         backup_state()
+        touch_heartbeat("openai-monitor-backup")
     elif len(sys.argv) >= 3 and sys.argv[1] == "--topup":
         try:
             amount = float(sys.argv[2])
@@ -1107,6 +1113,7 @@ def main():
         topup(amount)
     else:
         check_and_alert()
+        touch_heartbeat("openai-monitor-check")
 
 
 if __name__ == "__main__":

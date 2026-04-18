@@ -1,6 +1,7 @@
 """Unit tests for utils (shared state I/O + Telegram sender)."""
 
 import json
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -221,6 +222,47 @@ class SendTelegramDocumentTests(unittest.TestCase):
              patch("utils.time.sleep"):
             self.assertFalse(
                 utils.send_telegram_document(b"X", "t", "c", max_retries=2))
+
+
+class TouchHeartbeatTests(unittest.TestCase):
+    def test_writes_current_timestamp(self):
+        with TemporaryDirectory() as tmp:
+            utils.touch_heartbeat("test-unit", heartbeat_dir=tmp)
+            f = Path(tmp) / "test-unit.ts"
+            self.assertTrue(f.exists())
+            ts = int(f.read_text())
+            self.assertGreater(ts, int(time.time()) - 5)
+            self.assertLessEqual(ts, int(time.time()) + 1)
+
+    def test_creates_missing_directory(self):
+        with TemporaryDirectory() as tmp:
+            nested = Path(tmp) / "a" / "b"
+            utils.touch_heartbeat("u", heartbeat_dir=nested)
+            self.assertTrue((nested / "u.ts").exists())
+
+    def test_overwrites_previous_file(self):
+        with TemporaryDirectory() as tmp:
+            utils.touch_heartbeat("u", heartbeat_dir=tmp)
+            t1 = int((Path(tmp) / "u.ts").read_text())
+            time.sleep(1.1)
+            utils.touch_heartbeat("u", heartbeat_dir=tmp)
+            t2 = int((Path(tmp) / "u.ts").read_text())
+            self.assertGreater(t2, t1)
+
+    def test_uses_default_dir_when_none(self):
+        with TemporaryDirectory() as tmp:
+            with patch.object(utils, "HEARTBEAT_DIR", Path(tmp)):
+                utils.touch_heartbeat("unit-x")
+                self.assertTrue((Path(tmp) / "unit-x.ts").exists())
+
+    def test_oserror_is_swallowed_not_raised(self):
+        # If the filesystem is read-only, touch_heartbeat must NOT raise —
+        # otherwise a successful Telegram delivery could be masked by a
+        # trailing heartbeat failure.
+        with patch.object(Path, "mkdir",
+                          side_effect=PermissionError("ro fs")):
+            # should not raise
+            utils.touch_heartbeat("x")
 
 
 if __name__ == "__main__":

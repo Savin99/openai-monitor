@@ -33,6 +33,7 @@ from utils import (
     save_state,
     send_telegram_alert,
     send_telegram_photo,
+    touch_heartbeat,
 )
 
 
@@ -680,16 +681,23 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     args = sys.argv[1:]
+    # heartbeat is reached only when the subcommand completes without
+    # sys.exit(1) — watchdog uses the timestamp to spot silent liveness issues.
     if "--status" in args:
         send_status()
+        touch_heartbeat("sber-monitor-status")
     elif "--final-warning" in args:
         send_final_warning()
+        touch_heartbeat("sber-monitor-final-warning")
     elif "--friday-reminder" in args:
         send_friday_morning_reminder()
+        touch_heartbeat("sber-monitor-friday-reminder")
     elif "--force-refresh" in args:
         check_and_alert(force_refresh=True)
+        touch_heartbeat("sber-monitor-check")
     else:
         check_and_alert()
+        touch_heartbeat("sber-monitor-check")
 
 
 if __name__ == "__main__":

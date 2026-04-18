@@ -8,8 +8,27 @@ from pathlib import Path
 import requests
 
 DEFAULT_STATE_FILE = Path(__file__).parent / "monitor_state.json"
+HEARTBEAT_DIR = Path("/var/lib/monitor/heartbeat")
 
 log = logging.getLogger("monitor-utils")
+
+
+def touch_heartbeat(unit, heartbeat_dir=None):
+    """Write current unix timestamp to HEARTBEAT_DIR/<unit>.ts.
+
+    Called from main() after a CLI subcommand returns successfully. If the
+    command sys.exit(1)ed on a Telegram failure, we never reach this line
+    and the watchdog will eventually see a stale heartbeat → alert.
+
+    Failures here are best-effort (warn, do not raise) — we don't want a
+    filesystem glitch to mask a successful delivery.
+    """
+    try:
+        d = Path(heartbeat_dir) if heartbeat_dir else HEARTBEAT_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{unit}.ts").write_text(str(int(time.time())))
+    except OSError as e:
+        log.warning("heartbeat write failed for %s: %s", unit, e)
 
 
 def load_state(state_file=None):
