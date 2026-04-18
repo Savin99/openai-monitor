@@ -28,7 +28,12 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from utils import load_state, save_state, send_telegram_alert
+from utils import (
+    load_state,
+    save_state,
+    send_telegram_alert,
+    send_telegram_photo,
+)
 
 
 def _parse_labels(raw):
@@ -52,6 +57,7 @@ log = logging.getLogger("sber-monitor")
 
 SCRIPT_DIR = Path(__file__).parent
 TOKENS_FILE = SCRIPT_DIR / "sber_tokens.json"
+FINAL_WARNING_IMAGE = SCRIPT_DIR / "assets" / "final_warning.jpg"
 
 CONFIG = {
     "client_id": os.environ.get("SBER_CLIENT_ID", ""),
@@ -534,32 +540,44 @@ def send_final_warning():
         header = (
             f"🔴🔴🔴 <b>ПЯТНИЦА — ПОСЛЕДНИЙ ШАНС</b> 🔴🔴🔴\n"
             f"{now.strftime('%H:%M')} {CONFIG['alert_timezone']}\n\n"
-            f"Не положишь сейчас → <b>3 дня простоя</b> (сб, вс + пн утром).\n"
-            f"Каждый день без депозита — упущенный процент.\n"
+            f"Не положишь → <b>3 дня простоя</b> (сб + вс + пн утром).\n"
         )
-        footer = (
-            "<i>Пятница — ключевой день. Положи депозит, "
-            "иначе деньги провалятся все выходные.</i>"
-        )
+        footer = "<i>Пятница — ключевой день. Положи сейчас.</i>"
     else:
         header = (
             f"☠️ <b>ПОСЛЕДНИЙ ЗВОНОК — {now.strftime('%H:%M')} "
             f"{CONFIG['alert_timezone']}</b>\n\n"
             f"До закрытия окна: <b>{hours_left} ч.</b>\n"
-            f"Каждый час без депозита — упущенный процент.\n"
         )
-        footer = (
-            "<i>Положи сейчас — или ночь деньги лежат мёртвым грузом.</i>"
-        )
+        footer = "<i>Положи сейчас — или ночь деньги лежат мёртвым грузом.</i>"
 
-    message = (
+    # Telegram caption limit is 1024 chars — keep it lean, only essentials.
+    caption = (
         header + "\n"
-        + f"<b>Всё ещё выше порога {threshold_str} ₽:</b>\n"
-        + "\n".join(above_lines) + "\n"
-        + "<pre>" + FINAL_WARNING_ART + "</pre>\n"
+        + f"<b>Выше порога {threshold_str} ₽:</b>\n"
+        + "\n".join(above_lines) + "\n\n"
         + footer
     )
-    if _alert(message):
+
+    sent = False
+    if FINAL_WARNING_IMAGE.exists():
+        try:
+            photo_bytes = FINAL_WARNING_IMAGE.read_bytes()
+            sent = send_telegram_photo(
+                photo_bytes,
+                CONFIG["telegram_bot_token"],
+                CONFIG["telegram_chat_id"],
+                caption=caption,
+                filename=FINAL_WARNING_IMAGE.name,
+            )
+        except OSError as e:
+            log.error("Failed to read final warning image: %s", e)
+
+    if not sent:
+        # Fallback — send text-only so the final warning never silently drops
+        sent = _alert(caption)
+
+    if sent:
         print(f"Final warning sent at {now.strftime('%Y-%m-%dT%H:%M')}")
         sber_state["last_final_warning_date"] = today_str
         save_sber_state(sber_state)
