@@ -829,9 +829,25 @@ def check_and_alert():
     return remaining
 
 
+def send_status_report():
+    """Send current status message to Telegram (used for scheduled daily report)."""
+    missing = [k for k in ("openai_admin_key", "telegram_bot_token", "telegram_chat_id")
+               if not CONFIG[k]]
+    if missing:
+        print(f"Missing environment variables: {', '.join(v.upper() for v in missing)}")
+        return
+    message = get_status_message()
+    if send_telegram_alert(message):
+        print("Status report sent!")
+    else:
+        print("Failed to send status report")
+
+
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--bot":
         run_bot()
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--status":
+        send_status_report()
     elif len(sys.argv) >= 3 and sys.argv[1] == "--topup":
         try:
             amount = float(sys.argv[2])
