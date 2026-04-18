@@ -15,7 +15,14 @@
 #
 # Env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (from /etc/default/monitor-telegram)
 
-set -uo pipefail
+set -o pipefail
+
+# When run from systemd, TELEGRAM_* come from EnvironmentFile=. When run
+# manually for debugging, source them so the alert still has somewhere to go.
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" && -f /etc/default/monitor-telegram ]]; then
+  # shellcheck disable=SC1091
+  source /etc/default/monitor-telegram
+fi
 
 # ── layer 1: systemctl is-active ──────────────────────────────────────────────
 ACTIVE_UNITS=(
