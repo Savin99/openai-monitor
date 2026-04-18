@@ -1,10 +1,10 @@
 [Unit]
-Description=Run sber-monitor final warning at 19:55 MSK (16:55 UTC)
+Description=Run sber-monitor final warning at 19:50 MSK (16:50 UTC)
 
 [Timer]
 # Weekday-only filtering is enforced inside the service (weekend=silent),
-# so we fire every day at 16:55 UTC and let the script decide.
-OnCalendar=*-*-* 16:55:00 UTC
+# so we fire every day at 16:50 UTC and let the script decide.
+OnCalendar=*-*-* 16:50:00 UTC
 AccuracySec=1min
 Persistent=true
 Unit=sber-monitor-final-warning.service

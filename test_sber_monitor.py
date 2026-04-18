@@ -322,8 +322,8 @@ class SendFinalWarningTests(unittest.TestCase):
     TZ = ZoneInfo("Europe/Moscow")
     # Thursday 2026-04-16 at 19:55 MSK — default non-Friday weekday.
     # Friday-specific text is covered in a separate test below.
-    WEEKDAY_NOW = datetime(2026, 4, 16, 19, 55, tzinfo=TZ)
-    FRIDAY_NOW = datetime(2026, 4, 17, 19, 55, tzinfo=TZ)
+    WEEKDAY_NOW = datetime(2026, 4, 16, 19, 50, tzinfo=TZ)
+    FRIDAY_NOW = datetime(2026, 4, 17, 19, 50, tzinfo=TZ)
 
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -477,14 +477,14 @@ class SendFinalWarningTests(unittest.TestCase):
         mock_photo.assert_not_called()
 
     def test_silent_on_saturday(self):
-        saturday = datetime(2026, 4, 25, 19, 55, tzinfo=self.TZ)
+        saturday = datetime(2026, 4, 25, 19, 50, tzinfo=self.TZ)
         mock_alert, mock_photo, _ = self._run(
             balances=[7_000_000], now=saturday)
         mock_alert.assert_not_called()
         mock_photo.assert_not_called()
 
     def test_silent_on_sunday(self):
-        sunday = datetime(2026, 4, 26, 19, 55, tzinfo=self.TZ)
+        sunday = datetime(2026, 4, 26, 19, 50, tzinfo=self.TZ)
         mock_alert, mock_photo, _ = self._run(
             balances=[7_000_000], now=sunday)
         mock_alert.assert_not_called()
