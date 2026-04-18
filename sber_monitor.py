@@ -364,8 +364,10 @@ def build_status_message(accounts, above, sber_state):
 
 
 def check_and_alert(force_refresh=False):
+    # client_secret проверяется отдельно в refresh_access_token — без него скрипт
+    # работает пока access_token не истёк.
     missing = [
-        k for k in ("client_id", "client_secret", "telegram_bot_token", "telegram_chat_id")
+        k for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
         if not CONFIG[k]
     ]
     if missing:
