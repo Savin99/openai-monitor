@@ -5,13 +5,14 @@ Monitors spending and sends Telegram alerts when balance drops below threshold.
 """
 
 import requests
-import json
 import os
 import sys
 import time
 import logging
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
+
+from utils import load_state as _load_state_raw, save_state as _save_state_raw
+from utils import send_telegram_alert as _send_telegram_alert_raw
 
 # Configuration — secrets from environment variables
 CONFIG = {
@@ -23,8 +24,6 @@ CONFIG = {
 
 log = logging.getLogger("openai-monitor")
 
-# State file to track last alert and total_deposited
-STATE_FILE = Path(__file__).parent / "monitor_state.json"
 DEFAULT_TOTAL_DEPOSITED = 2408.71
 
 
@@ -207,48 +206,31 @@ def get_last_months_costs(num_months=3):
 
 
 def send_telegram_alert(message, max_retries=3):
-    """Send alert to Telegram with retries."""
-    url = f"https://api.telegram.org/bot{CONFIG['telegram_bot_token']}/sendMessage"
-    payload = {
-        "chat_id": CONFIG["telegram_chat_id"],
-        "text": message,
-        "parse_mode": "HTML"
-    }
-
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, json=payload, timeout=10)
-            data = response.json()
-            if response.status_code == 200 and data.get("ok"):
-                return True
-            log.error(f"Telegram API error (attempt {attempt + 1}): {data.get('description', response.status_code)}")
-        except requests.RequestException as e:
-            log.error(f"Telegram request failed (attempt {attempt + 1}): {e}")
-
-        if attempt < max_retries - 1:
-            time.sleep(2 ** attempt)
-
-    return False
+    """Send alert to Telegram (thin wrapper around utils)."""
+    return _send_telegram_alert_raw(
+        message,
+        CONFIG["telegram_bot_token"],
+        CONFIG["telegram_chat_id"],
+        max_retries=max_retries,
+    )
 
 
 def load_state():
-    """Load state from file."""
-    if STATE_FILE.exists():
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {
+    """Load state with OpenAI-specific defaults."""
+    state = _load_state_raw()
+    defaults = {
         "last_alert_date": None,
         "last_balance": None,
         "total_deposited": DEFAULT_TOTAL_DEPOSITED,
         "bot_offset": None,
-        "topup_history": []
+        "topup_history": [],
     }
+    return {**defaults, **state}
 
 
 def save_state(state):
     """Save state to file."""
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    _save_state_raw(state)
 
 
 def topup(amount):

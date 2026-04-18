@@ -1,4 +1,10 @@
 __pycache__/
 monitor_state.json
+sber_tokens.json
+.sber_auth_certs/
+sber_client*.p12
+sber_client*.pem
+sber_client*.key
+sber_ca_bundle.pem
 *.pyc
 CLAUDE.md
