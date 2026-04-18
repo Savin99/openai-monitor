@@ -1,0 +1,11 @@
+[Unit]
+Description=Run sber-monitor final warning daily at 20:00 MSK (17:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 17:00:00 UTC
+AccuracySec=1min
+Persistent=true
+Unit=sber-monitor-final-warning.service
+
+[Install]
+WantedBy=timers.target

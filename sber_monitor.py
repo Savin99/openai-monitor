@@ -435,6 +435,81 @@ def check_and_alert(force_refresh=False):
     save_sber_state(sber_state)
 
 
+FINAL_WARNING_ART = r"""
+             .---.
+            /o o o\
+            \  -  /
+             '---'
+            __|_|__
+           /       \
+          /  R.I.P  \
+         /           \
+        |  твой       |
+        |  депозит    |
+        |  2026       |
+        |             |
+        |  "почти     |
+        |   успел"    |
+    ____|_____________|____
+   ////|             |\\\\
+"""
+
+
+def send_final_warning():
+    """Send a dramatic last-call ping if any RC account is still above threshold.
+
+    Designed to fire at ~20:00 MSK — 4 hours before the alert window ends —
+    as a heavier-handed nudge than the hourly alert. Silent if balances are fine.
+    """
+    missing = [
+        k for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
+        if not CONFIG[k]
+    ]
+    if missing:
+        print("Missing env vars: " + ", ".join(missing))
+        return
+
+    access_token, tokens = get_valid_access_token()
+    check_refresh_token_expiry(tokens)
+    raw_accounts = get_client_accounts(access_token)
+    accounts = filter_rub_current_accounts(raw_accounts)
+    statement_date = now_in_alert_tz().strftime("%Y-%m-%d")
+    accounts = enrich_with_balances(access_token, accounts, statement_date)
+
+    threshold = CONFIG["balance_threshold"]
+    above = [a for a in accounts if a.get("balance", 0) > threshold]
+
+    if not above:
+        print("Final warning skipped — no accounts above threshold")
+        return
+
+    threshold_str = f"{threshold:,.0f}".replace(",", " ")
+    above_lines = []
+    for a in above:
+        label = account_label(a.get("accountNumber"))
+        balance_str = f"{a['balance']:,.2f}".replace(",", " ")
+        above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>")
+
+    now = now_in_alert_tz()
+    hours_left = max(0, CONFIG["alert_hour_end"] + 1 - now.hour)
+
+    message = (
+        f"☠️ <b>ПОСЛЕДНИЙ ЗВОНОК — {now.strftime('%H:%M')} "
+        f"{CONFIG['alert_timezone']}</b>\n\n"
+        f"До закрытия окна: <b>{hours_left} ч.</b>\n"
+        f"Каждый час без депозита — упущенный процент.\n\n"
+        f"<b>Всё ещё выше порога {threshold_str} ₽:</b>\n"
+        + "\n".join(above_lines)
+        + "\n"
+        + "<pre>" + FINAL_WARNING_ART + "</pre>\n"
+        + "<i>Положи сейчас — или ночь деньги лежат мёртвым грузом.</i>"
+    )
+    if _alert(message):
+        print(f"Final warning sent at {now.strftime('%Y-%m-%dT%H:%M')}")
+    else:
+        print("Failed to send final warning")
+
+
 def send_status():
     access_token, tokens = get_valid_access_token()
     check_refresh_token_expiry(tokens)
@@ -458,6 +533,8 @@ def main():
     args = sys.argv[1:]
     if "--status" in args:
         send_status()
+    elif "--final-warning" in args:
+        send_final_warning()
     elif "--force-refresh" in args:
         check_and_alert(force_refresh=True)
     else:

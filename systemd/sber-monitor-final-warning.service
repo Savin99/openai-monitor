@@ -1,0 +1,13 @@
+[Unit]
+Description=Sber final warning — drama alert if still above threshold at 20:00 MSK
+After=network-online.target
+Wants=network-online.target
+OnFailure=monitor-alert@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/openai_monitor
+ExecStart=/usr/bin/python3 /opt/openai_monitor/sber_monitor.py --final-warning
+# NB: inherits the same env as sber-monitor-check.service; deploy script copies
+# the Environment= lines from that unit at install time, OR migrate both to
+# EnvironmentFile=/etc/default/sber-monitor later.
