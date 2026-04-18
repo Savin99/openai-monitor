@@ -61,3 +61,71 @@ def send_telegram_alert(message, bot_token, chat_id, max_retries=3, parse_mode="
             time.sleep(2 ** attempt)
 
     return False
+
+
+def send_telegram_photo(photo_bytes, bot_token, chat_id,
+                        caption=None, parse_mode="HTML",
+                        filename="chart.png", max_retries=3):
+    """Send a PNG image to Telegram via sendPhoto with retries."""
+    if not bot_token or not chat_id:
+        log.error("Telegram bot_token or chat_id is empty")
+        return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    for attempt in range(max_retries):
+        try:
+            files = {"photo": (filename, photo_bytes, "image/png")}
+            data = {"chat_id": str(chat_id)}
+            if caption is not None:
+                data["caption"] = caption
+                data["parse_mode"] = parse_mode
+            response = requests.post(url, data=data, files=files, timeout=30)
+            resp_json = response.json()
+            if response.status_code == 200 and resp_json.get("ok"):
+                return True
+            log.error(
+                "Telegram sendPhoto error (attempt %d): %s",
+                attempt + 1,
+                resp_json.get("description", response.status_code),
+            )
+        except requests.RequestException as e:
+            log.error("Telegram sendPhoto failed (attempt %d): %s", attempt + 1, e)
+
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)
+
+    return False
+
+
+def send_telegram_document(document_bytes, bot_token, chat_id,
+                           caption=None, filename="document",
+                           max_retries=3):
+    """Send an arbitrary file to Telegram via sendDocument (plain text caption)."""
+    if not bot_token or not chat_id:
+        log.error("Telegram bot_token or chat_id is empty")
+        return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    for attempt in range(max_retries):
+        try:
+            files = {"document": (filename, document_bytes, "application/octet-stream")}
+            data = {"chat_id": str(chat_id)}
+            if caption is not None:
+                data["caption"] = caption
+            response = requests.post(url, data=data, files=files, timeout=30)
+            resp_json = response.json()
+            if response.status_code == 200 and resp_json.get("ok"):
+                return True
+            log.error(
+                "Telegram sendDocument error (attempt %d): %s",
+                attempt + 1,
+                resp_json.get("description", response.status_code),
+            )
+        except requests.RequestException as e:
+            log.error("Telegram sendDocument failed (attempt %d): %s",
+                      attempt + 1, e)
+
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)
+
+    return False

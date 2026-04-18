@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenAI Monitor — daily state backup to Telegram
+After=network-online.target
+Wants=network-online.target
+OnFailure=monitor-alert@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/openai_monitor
+EnvironmentFile=/etc/default/openai-monitor
+ExecStart=/usr/bin/python3 /opt/openai_monitor/openai_monitor.py --backup

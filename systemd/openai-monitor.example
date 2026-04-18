@@ -1,0 +1,8 @@
+# /etc/default/openai-monitor
+# Общий env-файл для всех openai-monitor-*.service (кроме уже установленных,
+# которые используют inline Environment=). На VPS лежит по пути выше с chmod 600.
+# НЕ КОММИТИТЬ реальные значения — это пример.
+
+OPENAI_ADMIN_KEY=REPLACE_ME
+TELEGRAM_BOT_TOKEN=REPLACE_ME
+TELEGRAM_CHAT_ID=REPLACE_ME

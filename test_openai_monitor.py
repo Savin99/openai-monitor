@@ -15,6 +15,7 @@
 import json
 import sys
 import unittest
+from datetime import date as date_type, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -504,25 +505,83 @@ class CheckAndAlertTests(StateIsolationMixin, unittest.TestCase):
 # ─────────────────────────────── send_status_report ────────────────────────────
 
 class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
-    def test_sends_message_on_success(self):
-        with patch("openai_monitor.get_status_message", return_value="STATUS"), \
-             patch("openai_monitor.send_telegram_alert", return_value=True) as mock_tg:
+    def _common_patches(self, remaining=100, forecast=10, chart_bytes=b"\x89PNG..."):
+        """Build a common patch setup — returns stack as list of contextmanagers."""
+        return [
+            patch("openai_monitor.get_total_costs", return_value=(50.0, None)),
+            patch("openai_monitor.get_today_costs", return_value=5.0),
+            patch("openai_monitor.get_billing_balance", return_value=None),
+            patch("openai_monitor.forecast_days_remaining", return_value=forecast),
+            patch("openai_monitor.get_daily_costs",
+                  return_value=[(date_type(2026, 4, 18), 5.0)]),
+            patch("openai_monitor.get_month_line_item_costs",
+                  return_value=[("gpt-5.2-2025-12-11, input", 25.0)]),
+        ]
+
+    def test_sends_chart_on_success(self):
+        self.write_state({"total_deposited": 150, "alert_threshold": 100,
+                          "topup_history": []})
+        patches = self._common_patches()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+             patch("charts.build_status_chart", return_value=b"\x89PNG-FAKE"), \
+             patch("openai_monitor.send_telegram_photo",
+                   return_value=True) as mock_photo, \
+             patch("openai_monitor.send_telegram_alert") as mock_alert:
             openai_monitor.send_status_report()
-        mock_tg.assert_called_once_with("STATUS")
+        mock_photo.assert_called_once()
+        # caption must include balance + forecast
+        caption = mock_photo.call_args.kwargs["caption"]
+        self.assertIn("100", caption)  # remaining = 150-50
+        self.assertIn("10 дн", caption)
+        mock_alert.assert_not_called()
+
+    def test_falls_back_to_text_when_chart_build_raises(self):
+        self.write_state({"total_deposited": 150, "alert_threshold": 100})
+        patches = self._common_patches()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+             patch("charts.build_status_chart",
+                   side_effect=RuntimeError("matplotlib died")), \
+             patch("openai_monitor.send_telegram_photo") as mock_photo, \
+             patch("openai_monitor.send_telegram_alert",
+                   return_value=True) as mock_alert:
+            openai_monitor.send_status_report()
+        mock_photo.assert_not_called()
+        mock_alert.assert_called_once()
+
+    def test_falls_back_to_text_when_sendPhoto_fails(self):
+        self.write_state({"total_deposited": 150, "alert_threshold": 100})
+        patches = self._common_patches()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+             patch("charts.build_status_chart", return_value=b"\x89PNG"), \
+             patch("openai_monitor.send_telegram_photo",
+                   return_value=False) as mock_photo, \
+             patch("openai_monitor.send_telegram_alert",
+                   return_value=True) as mock_alert:
+            openai_monitor.send_status_report()
+        mock_photo.assert_called_once()
+        mock_alert.assert_called_once()
+
+    def test_warning_emoji_when_forecast_low(self):
+        self.write_state({"total_deposited": 150, "alert_threshold": 100})
+        patches = self._common_patches(forecast=3)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+             patch("charts.build_status_chart", return_value=b"\x89PNG"), \
+             patch("openai_monitor.send_telegram_photo",
+                   return_value=True) as mock_photo:
+            openai_monitor.send_status_report()
+        caption = mock_photo.call_args.kwargs["caption"]
+        self.assertIn("⚠️", caption)
+        self.assertIn("3 дн", caption)
 
     def test_missing_env_aborts(self):
         openai_monitor.CONFIG["openai_admin_key"] = ""
         with patch("openai_monitor.get_status_message") as mock_msg, \
+             patch("openai_monitor.get_total_costs") as mock_costs, \
              patch("openai_monitor.send_telegram_alert") as mock_tg:
             openai_monitor.send_status_report()
         mock_msg.assert_not_called()
+        mock_costs.assert_not_called()
         mock_tg.assert_not_called()
-
-    def test_telegram_failure_is_swallowed(self):
-        with patch("openai_monitor.get_status_message", return_value="S"), \
-             patch("openai_monitor.send_telegram_alert", return_value=False):
-            # should not raise
-            openai_monitor.send_status_report()
 
 
 # ───────────────────────────────── main routing ────────────────────────────────
@@ -539,6 +598,12 @@ class MainRoutingTests(unittest.TestCase):
              patch.object(sys, "argv", ["openai_monitor.py", "--status"]):
             openai_monitor.main()
         mock_st.assert_called_once()
+
+    def test_backup_flag_invokes_backup(self):
+        with patch("openai_monitor.backup_state") as mock_bk, \
+             patch.object(sys, "argv", ["openai_monitor.py", "--backup"]):
+            openai_monitor.main()
+        mock_bk.assert_called_once()
 
     def test_topup_flag_with_valid_amount(self):
         with patch("openai_monitor.topup") as mock_tu, \
@@ -557,6 +622,171 @@ class MainRoutingTests(unittest.TestCase):
              patch.object(sys, "argv", ["openai_monitor.py"]):
             openai_monitor.main()
         mock_ca.assert_called_once()
+
+
+# ──────────────────────────────── get_daily_costs ──────────────────────────────
+
+class GetDailyCostsTests(StateIsolationMixin, unittest.TestCase):
+    def _bucket(self, ts, amount):
+        return {"start_time": ts,
+                "results": [{"amount": {"value": str(amount), "currency": "usd"}}]}
+
+    def test_fills_missing_days_with_zero(self):
+        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Return only 1 bucket for yesterday (value 5); expect 3 days, other two = 0
+        yesterday_ts = int((today - timedelta(days=1)).timestamp())
+        payload = {"data": [self._bucket(yesterday_ts, 5.0)], "has_more": False}
+        resp = MagicMock(); resp.status_code = 200; resp.json.return_value = payload
+        with patch("openai_monitor.requests.get", return_value=resp):
+            daily = openai_monitor.get_daily_costs(3)
+        self.assertEqual(len(daily), 3)
+        dates = [d for d, _ in daily]
+        self.assertEqual(dates, sorted(dates))  # ascending
+        amounts = [v for _, v in daily]
+        # exactly one day has value 5.0, others are 0
+        self.assertEqual(sorted(amounts, reverse=True), [5.0, 0, 0])
+
+    def test_returns_empty_on_http_error(self):
+        resp = MagicMock(); resp.status_code = 500; resp.text = "server error"
+        with patch("openai_monitor.requests.get", return_value=resp):
+            daily = openai_monitor.get_daily_costs(7)
+        self.assertEqual(daily, [])
+
+    def test_returns_empty_on_network_error(self):
+        with patch("openai_monitor.requests.get",
+                   side_effect=requests.ConnectionError("no")):
+            self.assertEqual(openai_monitor.get_daily_costs(7), [])
+
+
+# ─────────────────────────────── get_line_item_costs ───────────────────────────
+
+class GetLineItemCostsTests(StateIsolationMixin, unittest.TestCase):
+    def _page(self, items, has_more=False, next_page=None):
+        return {
+            "has_more": has_more,
+            "next_page": next_page,
+            "data": [
+                {"results": [
+                    {"line_item": li, "amount": {"value": str(v), "currency": "usd"}}
+                    for li, v in items
+                ]}
+            ],
+        }
+
+    def test_aggregates_and_sorts_desc(self):
+        p1 = self._page([("gpt-5.2, input", 10), ("whisper-1, audio", 3),
+                         ("gpt-5.2, input", 5)])
+        resp = MagicMock(); resp.status_code = 200; resp.json.return_value = p1
+        with patch("openai_monitor.requests.get", return_value=resp):
+            out = openai_monitor.get_line_item_costs(1000)
+        # two items, gpt-5.2 total 15, whisper-1 total 3
+        self.assertEqual(out[0], ("gpt-5.2, input", 15.0))
+        self.assertEqual(out[1], ("whisper-1, audio", 3.0))
+
+    def test_paginates(self):
+        p1 = self._page([("m1, input", 10)], has_more=True, next_page="p2")
+        p2 = self._page([("m2, input", 20)])
+        responses = []
+        for p in (p1, p2):
+            r = MagicMock(); r.status_code = 200; r.json.return_value = p
+            responses.append(r)
+        with patch("openai_monitor.requests.get", side_effect=responses):
+            out = openai_monitor.get_line_item_costs(1000)
+        self.assertEqual(dict(out), {"m1, input": 10.0, "m2, input": 20.0})
+
+    def test_stops_on_http_error(self):
+        resp = MagicMock(); resp.status_code = 500
+        with patch("openai_monitor.requests.get", return_value=resp):
+            self.assertEqual(openai_monitor.get_line_item_costs(1000), [])
+
+
+# ───────────────────────────── forecast_days_remaining ─────────────────────────
+
+class ForecastDaysRemainingTests(StateIsolationMixin, unittest.TestCase):
+    def test_returns_none_when_no_daily_data(self):
+        with patch("openai_monitor.get_daily_costs", return_value=[]):
+            self.assertIsNone(openai_monitor.forecast_days_remaining(100))
+
+    def test_returns_none_when_total_zero(self):
+        today = date_type.today()
+        daily = [(today - timedelta(days=i), 0) for i in range(7)]
+        with patch("openai_monitor.get_daily_costs", return_value=daily):
+            self.assertIsNone(openai_monitor.forecast_days_remaining(100))
+
+    def test_returns_zero_when_balance_zero_or_negative(self):
+        with patch("openai_monitor.get_daily_costs") as mock_d:
+            self.assertEqual(openai_monitor.forecast_days_remaining(0), 0)
+            self.assertEqual(openai_monitor.forecast_days_remaining(-10), 0)
+        mock_d.assert_not_called()
+
+    def test_returns_int_estimate(self):
+        today = date_type.today()
+        # 7 days, $10/day → avg 10
+        daily = [(today - timedelta(days=i), 10) for i in range(7)]
+        with patch("openai_monitor.get_daily_costs", return_value=daily):
+            self.assertEqual(openai_monitor.forecast_days_remaining(100), 10)
+
+    def test_returns_none_for_none_remaining(self):
+        self.assertIsNone(openai_monitor.forecast_days_remaining(None))
+
+
+# ─────────────────────────────── parse topup date ──────────────────────────────
+
+class ParseTopupDateTests(unittest.TestCase):
+    def test_actual_datetime_with_time(self):
+        d = openai_monitor._parse_topup_date(
+            {"actual_datetime": "01.02.2026 14:30"})
+        self.assertEqual(d, date_type(2026, 2, 1))
+
+    def test_date_only(self):
+        d = openai_monitor._parse_topup_date({"date": "15.04.2026"})
+        self.assertEqual(d, date_type(2026, 4, 15))
+
+    def test_date_with_time_fallback_format(self):
+        d = openai_monitor._parse_topup_date({"date": "15.04.2026 10:00"})
+        self.assertEqual(d, date_type(2026, 4, 15))
+
+    def test_invalid_returns_none(self):
+        self.assertIsNone(openai_monitor._parse_topup_date({"date": "garbage"}))
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(openai_monitor._parse_topup_date({}))
+
+
+# ────────────────────────────────── backup_state ───────────────────────────────
+
+class BackupStateTests(StateIsolationMixin, unittest.TestCase):
+    def test_sends_state_file_as_document(self):
+        self.write_state({"total_deposited": 100})
+        with patch("openai_monitor.send_telegram_document",
+                   return_value=True) as mock_send:
+            openai_monitor.backup_state()
+        mock_send.assert_called_once()
+        kwargs = mock_send.call_args.kwargs
+        args = mock_send.call_args.args
+        sent_bytes = args[0] if args else kwargs.get("document_bytes")
+        self.assertIn(b"total_deposited", sent_bytes)
+
+    def test_missing_env_aborts(self):
+        openai_monitor.CONFIG["telegram_bot_token"] = ""
+        with patch("openai_monitor.send_telegram_document") as mock_send:
+            openai_monitor.backup_state()
+        mock_send.assert_not_called()
+
+    def test_missing_state_file_aborts(self):
+        # No write_state call → file does not exist
+        with patch("openai_monitor.send_telegram_document") as mock_send:
+            openai_monitor.backup_state()
+        mock_send.assert_not_called()
+
+    def test_filename_contains_timestamp(self):
+        self.write_state({"x": 1})
+        with patch("openai_monitor.send_telegram_document",
+                   return_value=True) as mock_send:
+            openai_monitor.backup_state()
+        filename = mock_send.call_args.kwargs["filename"]
+        self.assertTrue(filename.startswith("monitor_state_"))
+        self.assertTrue(filename.endswith(".json"))
 
 
 if __name__ == "__main__":

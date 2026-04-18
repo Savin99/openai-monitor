@@ -129,5 +129,99 @@ class SendTelegramAlertTests(unittest.TestCase):
             self.assertFalse(utils.send_telegram_alert("m", "t", "c", max_retries=3))
 
 
+class SendTelegramPhotoTests(unittest.TestCase):
+    def _ok(self):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"ok": True}
+        return r
+
+    def _err(self, description="bad"):
+        r = MagicMock()
+        r.status_code = 400
+        r.json.return_value = {"ok": False, "description": description}
+        return r
+
+    def test_no_creds_skips_request(self):
+        with patch("utils.requests.post") as mock_post:
+            self.assertFalse(utils.send_telegram_photo(b"PNG", "", "1"))
+            self.assertFalse(utils.send_telegram_photo(b"PNG", "t", ""))
+            mock_post.assert_not_called()
+
+    def test_success_posts_multipart(self):
+        with patch("utils.requests.post", return_value=self._ok()) as mock_post:
+            ok = utils.send_telegram_photo(b"PNGDATA", "TKN", "42",
+                                           caption="hi", filename="x.png")
+        self.assertTrue(ok)
+        url = mock_post.call_args.args[0]
+        self.assertIn("/sendPhoto", url)
+        self.assertIn("botTKN", url)
+        kwargs = mock_post.call_args.kwargs
+        self.assertIn("files", kwargs)
+        self.assertEqual(kwargs["files"]["photo"][0], "x.png")
+        self.assertEqual(kwargs["files"]["photo"][1], b"PNGDATA")
+        self.assertEqual(kwargs["data"]["chat_id"], "42")
+        self.assertEqual(kwargs["data"]["caption"], "hi")
+
+    def test_no_caption_omits_caption_fields(self):
+        with patch("utils.requests.post", return_value=self._ok()) as mock_post:
+            utils.send_telegram_photo(b"X", "t", "c")
+        data = mock_post.call_args.kwargs["data"]
+        self.assertNotIn("caption", data)
+        self.assertNotIn("parse_mode", data)
+
+    def test_retries_on_error_then_success(self):
+        with patch("utils.requests.post",
+                   side_effect=[self._err(), self._ok()]), \
+             patch("utils.time.sleep"):
+            ok = utils.send_telegram_photo(b"X", "t", "c", max_retries=2)
+        self.assertTrue(ok)
+
+    def test_returns_false_after_all_retries(self):
+        with patch("utils.requests.post", side_effect=[self._err()] * 3), \
+             patch("utils.time.sleep"):
+            self.assertFalse(
+                utils.send_telegram_photo(b"X", "t", "c", max_retries=3))
+
+    def test_network_exception_retried(self):
+        with patch("utils.requests.post",
+                   side_effect=[requests.ConnectionError("x"), self._ok()]), \
+             patch("utils.time.sleep"):
+            self.assertTrue(
+                utils.send_telegram_photo(b"X", "t", "c", max_retries=2))
+
+
+class SendTelegramDocumentTests(unittest.TestCase):
+    def _ok(self):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"ok": True}
+        return r
+
+    def test_no_creds_skips(self):
+        with patch("utils.requests.post") as mock_post:
+            self.assertFalse(utils.send_telegram_document(b"X", "", "1"))
+            mock_post.assert_not_called()
+
+    def test_success(self):
+        with patch("utils.requests.post", return_value=self._ok()) as mock_post:
+            ok = utils.send_telegram_document(
+                b"DATA", "TKN", "99", caption="cap", filename="state.json")
+        self.assertTrue(ok)
+        url = mock_post.call_args.args[0]
+        self.assertIn("/sendDocument", url)
+        kwargs = mock_post.call_args.kwargs
+        self.assertEqual(kwargs["files"]["document"][0], "state.json")
+        self.assertEqual(kwargs["files"]["document"][1], b"DATA")
+        self.assertEqual(kwargs["data"]["caption"], "cap")
+
+    def test_network_failure_returns_false(self):
+        with patch("utils.requests.post",
+                   side_effect=requests.Timeout("t")), \
+             patch("utils.time.sleep"):
+            self.assertFalse(
+                utils.send_telegram_document(b"X", "t", "c", max_retries=2))
+
+
 if __name__ == "__main__":
     unittest.main()

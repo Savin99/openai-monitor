@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily backup of monitor_state.json to Telegram (03:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+AccuracySec=1min
+Persistent=true
+Unit=openai-monitor-backup.service
+
+[Install]
+WantedBy=timers.target
