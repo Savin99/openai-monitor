@@ -1,0 +1,6 @@
+# /etc/default/monitor-telegram
+# Общий env-файл для monitor-alert@.service и monitor-watchdog.service.
+# НЕ КОММИТИТЬ реальные значения (этот файл — пример). На VPS лежит по пути выше.
+
+TELEGRAM_BOT_TOKEN=REPLACE_ME
+TELEGRAM_CHAT_ID=REPLACE_ME

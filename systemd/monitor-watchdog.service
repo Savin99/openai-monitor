@@ -1,0 +1,10 @@
+[Unit]
+Description=Monitor watchdog — verify critical units are active
+After=network-online.target
+Wants=network-online.target
+OnFailure=monitor-alert@%N.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/monitor-telegram
+ExecStart=/usr/local/bin/monitor-watchdog.sh

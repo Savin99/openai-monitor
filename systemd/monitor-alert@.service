@@ -1,0 +1,9 @@
+[Unit]
+Description=Telegram alert for failed unit %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/monitor-telegram
+ExecStart=/usr/local/bin/monitor-alert.sh %i
