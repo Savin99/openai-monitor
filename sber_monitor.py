@@ -314,6 +314,63 @@ def save_sber_state(sber_state):
     save_state(state)
 
 
+STALE_BALANCE_DAYS = 7  # alert when balance hasn't moved for this many days
+
+
+def update_balance_change_history(accounts, sber_state, now_ts=None):
+    """Track per-account balance-change timestamps in sber_state.
+
+    Rationale: if the Sber API starts returning stale data (cached session,
+    TLS misconfigured → fallback to last-known-good, etc.), every final
+    warning will keep showing "все миллионы всё ещё там" and we won't be
+    able to tell whether the account is truly idle or the API is broken.
+
+    Strategy:
+      - history[account_number] = {"balance": float, "last_changed_at": int}
+      - First time we see an account → record balance + now
+      - Subsequent runs:
+          same balance → keep last_changed_at untouched
+          different balance → update both
+
+    Returns the updated history dict (also mutates sber_state in-place).
+    """
+    import time as _t
+    if now_ts is None:
+        now_ts = int(_t.time())
+    hist = sber_state.setdefault("balance_changes", {})
+    for a in accounts:
+        num = a.get("accountNumber")
+        bal = a.get("balance")
+        if not num or bal is None:
+            continue
+        prev = hist.get(num)
+        if prev is None or prev.get("balance") != bal:
+            hist[num] = {"balance": float(bal), "last_changed_at": now_ts}
+        # else: balance unchanged, keep timestamp
+    return hist
+
+
+def format_stale_note(account_number, sber_state, now_ts=None):
+    """Return ' · N д. без движения' suffix, possibly with ⚠️.
+
+    Empty string if we have no history yet (first run) or if data is too
+    fresh to comment on.
+    """
+    import time as _t
+    if now_ts is None:
+        now_ts = int(_t.time())
+    hist = sber_state.get("balance_changes", {})
+    entry = hist.get(account_number)
+    if not entry:
+        return ""
+    changed_at = entry.get("last_changed_at", 0)
+    age_days = (now_ts - changed_at) // 86400
+    if age_days < 1:
+        return ""
+    marker = " ⚠️" if age_days >= STALE_BALANCE_DAYS else ""
+    return f" · {age_days} д. без движения{marker}"
+
+
 def format_accounts(accounts, highlight_threshold=None):
     """Форматирует список счетов для Telegram. Помечает превышения жирным."""
     if not accounts:
@@ -405,6 +462,8 @@ def check_and_alert(force_refresh=False):
 
     sber_state = get_sber_state()
     last_alert_hour = sber_state.get("last_alert_hour")
+    now_ts = int(now.timestamp())
+    update_balance_change_history(accounts, sber_state, now_ts=now_ts)
 
     threshold_str = f"{threshold:,.0f}".replace(",", " ")
     print(f"RUB current accounts: {len(accounts)}, above threshold: {len(above)}")
@@ -427,7 +486,9 @@ def check_and_alert(force_refresh=False):
         for a in above:
             label = account_label(a.get("accountNumber"))
             balance_str = f"{a['balance']:,.2f}".replace(",", " ")
-            above_lines.append(f"  {label}: <b>{balance_str} ₽</b>")
+            stale = format_stale_note(a.get("accountNumber"), sber_state,
+                                       now_ts=now_ts)
+            above_lines.append(f"  {label}: <b>{balance_str} ₽</b>{stale}")
         message = (
             f"🚨 <b>СберБизнес — положи деньги на депозит</b>\n\n"
             f"Превышение порога {threshold_str} ₽ на счетах:\n"
@@ -527,7 +588,13 @@ def send_final_warning():
     threshold = CONFIG["balance_threshold"]
     above = [a for a in accounts if a.get("balance", 0) > threshold]
 
+    # Refresh stale-balance history every time we fetch, including here
+    now_ts = int(now.timestamp())
+    update_balance_change_history(accounts, sber_state, now_ts=now_ts)
+
     if not above:
+        # Persist the refreshed balance_changes even if we skip the alert
+        save_sber_state(sber_state)
         print("Final warning skipped — no accounts above threshold")
         return
 
@@ -536,7 +603,9 @@ def send_final_warning():
     for a in above:
         label = account_label(a.get("accountNumber"))
         balance_str = f"{a['balance']:,.2f}".replace(",", " ")
-        above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>")
+        stale = format_stale_note(a.get("accountNumber"), sber_state,
+                                   now_ts=now_ts)
+        above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>{stale}")
 
     hours_left = max(0, CONFIG["alert_hour_end"] + 1 - now.hour)
     is_friday = now.weekday() == 4
@@ -627,7 +696,12 @@ def send_friday_morning_reminder():
 
     threshold = CONFIG["balance_threshold"]
     above = [a for a in accounts if a.get("balance", 0) > threshold]
+
+    now_ts = int(now.timestamp())
+    update_balance_change_history(accounts, sber_state, now_ts=now_ts)
+
     if not above:
+        save_sber_state(sber_state)
         print("Friday reminder skipped — no accounts above threshold")
         return
 
@@ -636,7 +710,9 @@ def send_friday_morning_reminder():
     for a in above:
         label = account_label(a.get("accountNumber"))
         balance_str = f"{a['balance']:,.2f}".replace(",", " ")
-        above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>")
+        stale = format_stale_note(a.get("accountNumber"), sber_state,
+                                   now_ts=now_ts)
+        above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>{stale}")
 
     message = (
         f"☕ <b>Пятница — напоминание</b>\n"

@@ -687,6 +687,137 @@ class SendFridayMorningReminderTests(unittest.TestCase):
         mock_fw.assert_called_once()
 
 
+class BalanceChangeHistoryTests(unittest.TestCase):
+    """Stale balance detection — phase 3 of reliability work."""
+
+    def test_first_seen_records_timestamp(self):
+        accounts = [{"accountNumber": "A1", "balance": 100_000.0}]
+        sber_state = {}
+        hist = sber_monitor.update_balance_change_history(
+            accounts, sber_state, now_ts=1000)
+        self.assertEqual(hist["A1"]["balance"], 100_000.0)
+        self.assertEqual(hist["A1"]["last_changed_at"], 1000)
+        # also mutated in-place
+        self.assertIs(sber_state["balance_changes"], hist)
+
+    def test_unchanged_balance_keeps_timestamp(self):
+        sber_state = {
+            "balance_changes": {"A1": {"balance": 100.0, "last_changed_at": 500}}
+        }
+        accounts = [{"accountNumber": "A1", "balance": 100.0}]
+        sber_monitor.update_balance_change_history(
+            accounts, sber_state, now_ts=99999)
+        self.assertEqual(
+            sber_state["balance_changes"]["A1"]["last_changed_at"], 500)
+
+    def test_changed_balance_bumps_timestamp(self):
+        sber_state = {
+            "balance_changes": {"A1": {"balance": 100.0, "last_changed_at": 500}}
+        }
+        accounts = [{"accountNumber": "A1", "balance": 250.0}]
+        sber_monitor.update_balance_change_history(
+            accounts, sber_state, now_ts=99999)
+        self.assertEqual(sber_state["balance_changes"]["A1"],
+                         {"balance": 250.0, "last_changed_at": 99999})
+
+    def test_skips_account_with_no_number(self):
+        sber_state = {}
+        accounts = [{"balance": 100.0}]  # no accountNumber
+        hist = sber_monitor.update_balance_change_history(
+            accounts, sber_state, now_ts=1000)
+        self.assertEqual(hist, {})
+
+    def test_skips_account_with_none_balance(self):
+        sber_state = {}
+        accounts = [{"accountNumber": "A1", "balance": None}]
+        sber_monitor.update_balance_change_history(
+            accounts, sber_state, now_ts=1000)
+        self.assertNotIn("A1", sber_state["balance_changes"])
+
+
+class FormatStaleNoteTests(unittest.TestCase):
+    def test_empty_when_no_history(self):
+        self.assertEqual(
+            sber_monitor.format_stale_note("A1", {}, now_ts=1000), "")
+
+    def test_empty_when_age_under_one_day(self):
+        s = {"balance_changes": {
+            "A1": {"balance": 100.0, "last_changed_at": 1000}
+        }}
+        # 12h later
+        self.assertEqual(
+            sber_monitor.format_stale_note(
+                "A1", s, now_ts=1000 + 12 * 3600),
+            "",
+        )
+
+    def test_renders_age_without_warning_for_short_period(self):
+        s = {"balance_changes": {
+            "A1": {"balance": 100.0, "last_changed_at": 1000}
+        }}
+        # 3 days later (<7)
+        note = sber_monitor.format_stale_note(
+            "A1", s, now_ts=1000 + 3 * 86400)
+        self.assertEqual(note, " · 3 д. без движения")
+        self.assertNotIn("⚠️", note)
+
+    def test_warns_when_older_than_threshold(self):
+        s = {"balance_changes": {
+            "A1": {"balance": 100.0, "last_changed_at": 1000}
+        }}
+        note = sber_monitor.format_stale_note(
+            "A1", s, now_ts=1000 + 8 * 86400)
+        self.assertIn("8 д.", note)
+        self.assertIn("⚠️", note)
+
+    def test_check_and_alert_integrates_stale_note_in_message(self):
+        # end-to-end: check_and_alert should include " ⚠️ X д. без движения"
+        # when balance hasn't moved in 8+ days
+        tz = ZoneInfo("Europe/Moscow")
+        now = datetime(2026, 4, 15, 16, 0, tzinfo=tz)  # Wednesday 16:00
+        tmp = TemporaryDirectory()
+        tmp_path = Path(tmp.name) / "monitor_state.json"
+        old_ts = int(now.timestamp()) - 9 * 86400
+        tmp_path.write_text(json.dumps({
+            "sber": {
+                "balance_changes": {
+                    "40802810000000001111": {
+                        "balance": 7_000_000.0, "last_changed_at": old_ts,
+                    }
+                }
+            }
+        }))
+        try:
+            with patch("utils.DEFAULT_STATE_FILE", tmp_path), \
+                 patch.dict(sber_monitor.CONFIG, {
+                     "client_id": "cid", "client_secret": "cs",
+                     "telegram_bot_token": "t", "telegram_chat_id": "1",
+                     "balance_threshold": 5_000_000,
+                     "alert_timezone": "Europe/Moscow",
+                     "alert_hour_start": 15, "alert_hour_end": 19,
+                 }), \
+                 patch.object(sber_monitor, "get_valid_access_token",
+                              return_value=("tok", {"refresh_issued_at": int(time.time())})), \
+                 patch.object(sber_monitor, "get_client_accounts",
+                              return_value=[{"currencyCode": "RUB",
+                                             "accountType": "CURRENT",
+                                             "state": "OPEN",
+                                             "accountNumber": "40802810000000001111",
+                                             "balance": 7_000_000.0}]), \
+                 patch.object(sber_monitor, "enrich_with_balances",
+                              side_effect=lambda t, a, d: a), \
+                 patch.object(sber_monitor, "check_refresh_token_expiry"), \
+                 patch.object(sber_monitor, "_alert", return_value=True) as mock_alert, \
+                 patch.object(sber_monitor, "now_in_alert_tz", return_value=now):
+                sber_monitor.check_and_alert()
+            mock_alert.assert_called_once()
+            msg = mock_alert.call_args.args[0]
+            self.assertIn("9 д. без движения", msg)
+            self.assertIn("⚠️", msg)
+        finally:
+            tmp.cleanup()
+
+
 class RefreshAccessTokenTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
