@@ -442,6 +442,10 @@ def check_and_alert(force_refresh=False):
             sber_state["last_alert_hour"] = current_hour_key
         else:
             print("Failed to send alert")
+            sber_state["last_accounts"] = accounts
+            sber_state["threshold_rub"] = threshold
+            save_sber_state(sber_state)
+            sys.exit(1)
 
     sber_state["last_accounts"] = accounts
     sber_state["threshold_rub"] = threshold
@@ -583,6 +587,7 @@ def send_final_warning():
         save_sber_state(sber_state)
     else:
         print("Failed to send final warning")
+        sys.exit(1)
 
 
 def send_friday_morning_reminder():
@@ -650,6 +655,7 @@ def send_friday_morning_reminder():
         save_sber_state(sber_state)
     else:
         print("Failed to send friday reminder")
+        sys.exit(1)
 
 
 def send_status():
@@ -667,6 +673,7 @@ def send_status():
         print("Status sent")
     else:
         print("Failed to send status")
+        sys.exit(1)
 
 
 def main():

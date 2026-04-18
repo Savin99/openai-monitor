@@ -277,6 +277,26 @@ class CheckAndAlertTests(unittest.TestCase):
             mock_alert.assert_called_once()
             self.assertEqual(sber["last_alert_hour"], f"2026-04-15T{hour:02d}")
 
+    def test_telegram_failure_raises_systemexit(self):
+        # hourly check: balance above threshold but Telegram fails → sys.exit(1)
+        now = datetime(2026, 4, 15, 16, 0, tzinfo=self.TZ)  # Wednesday
+        tokens, accounts = self._mock_token_and_accounts([7_000_000])
+        with patch.object(sber_monitor, "get_valid_access_token",
+                          return_value=("tok", tokens)), \
+             patch.object(sber_monitor, "get_client_accounts",
+                          return_value=accounts), \
+             patch.object(sber_monitor, "enrich_with_balances",
+                          side_effect=lambda t, a, d: a), \
+             patch.object(sber_monitor, "check_refresh_token_expiry"), \
+             patch.object(sber_monitor, "_alert", return_value=False), \
+             patch.object(sber_monitor, "now_in_alert_tz", return_value=now):
+            with self.assertRaises(SystemExit) as cm:
+                sber_monitor.check_and_alert()
+            self.assertEqual(cm.exception.code, 1)
+        # last_alert_hour must NOT be marked — next run retries
+        state = json.loads(self._tmp_path.read_text()) if self._tmp_path.exists() else {}
+        self.assertIsNone(state.get("sber", {}).get("last_alert_hour"))
+
     def test_weekend_skip_saturday(self):
         # Saturday 2026-04-25 — no alert even if above threshold
         now = datetime(2026, 4, 25, 16, 30, tzinfo=self.TZ)
@@ -503,12 +523,16 @@ class SendFinalWarningTests(unittest.TestCase):
         mock_alert.assert_called_once()
         self.assertEqual(sber["last_final_warning_date"], "2026-04-16")
 
-    def test_does_not_mark_sent_if_telegram_fails(self):
+    def test_telegram_failure_raises_systemexit_and_does_not_mark_sent(self):
+        # All delivery paths fail → sys.exit(1) so systemd OnFailure fires.
+        # State must NOT be marked sent, so the next run retries cleanly.
         accounts = [
             {"currencyCode": "RUB", "accountType": "CURRENT", "state": "OPEN",
              "accountNumber": "40802810111111111111", "balance": 7_000_000}
         ]
-        with patch.object(sber_monitor, "get_valid_access_token",
+        missing_image = Path(self._tmp.name) / "nonexistent.jpg"
+        with patch.object(sber_monitor, "FINAL_WARNING_IMAGE", missing_image), \
+             patch.object(sber_monitor, "get_valid_access_token",
                           return_value=("tok", {"refresh_issued_at": int(time.time())})), \
              patch.object(sber_monitor, "get_client_accounts", return_value=accounts), \
              patch.object(sber_monitor, "enrich_with_balances",
@@ -517,9 +541,10 @@ class SendFinalWarningTests(unittest.TestCase):
              patch.object(sber_monitor, "_alert", return_value=False), \
              patch.object(sber_monitor, "now_in_alert_tz",
                           return_value=self.WEEKDAY_NOW):
-            sber_monitor.send_final_warning()
+            with self.assertRaises(SystemExit) as cm:
+                sber_monitor.send_final_warning()
+            self.assertEqual(cm.exception.code, 1)
         state = json.loads(self._tmp_path.read_text()) if self._tmp_path.exists() else {}
-        # Telegram failed — we must NOT mark as sent; retry will be possible
         self.assertNotIn("last_final_warning_date", state.get("sber", {}))
 
     def test_cli_flag_routes_to_send_final_warning(self):
@@ -634,7 +659,7 @@ class SendFridayMorningReminderTests(unittest.TestCase):
         mock_tok.assert_not_called()
         mock_alert.assert_not_called()
 
-    def test_does_not_mark_sent_if_telegram_fails(self):
+    def test_telegram_failure_raises_systemexit_and_does_not_mark_sent(self):
         accounts = [
             {"currencyCode": "RUB", "accountType": "CURRENT", "state": "OPEN",
              "accountNumber": "40802810111111111111", "balance": 7_000_000}
@@ -648,7 +673,9 @@ class SendFridayMorningReminderTests(unittest.TestCase):
              patch.object(sber_monitor, "_alert", return_value=False), \
              patch.object(sber_monitor, "now_in_alert_tz",
                           return_value=self.FRIDAY_NOW):
-            sber_monitor.send_friday_morning_reminder()
+            with self.assertRaises(SystemExit) as cm:
+                sber_monitor.send_friday_morning_reminder()
+            self.assertEqual(cm.exception.code, 1)
         state = json.loads(self._tmp_path.read_text()) if self._tmp_path.exists() else {}
         self.assertNotIn("last_friday_reminder_date", state.get("sber", {}))
 

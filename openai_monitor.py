@@ -963,6 +963,10 @@ def check_and_alert():
                 save_state(state)
             else:
                 print("Failed to send Telegram alert")
+                # Non-zero exit → systemd OnFailure fires → monitor-alert@ fires
+                # (which re-attempts Telegram via a different path). Prevents
+                # a silent drop where exit=0 hides a failed delivery.
+                sys.exit(1)
     else:
         print(f"\n[OK] Balance above threshold")
         # Reset alert level when balance is topped up above threshold
@@ -1061,6 +1065,9 @@ def send_status_report():
         print("Status report (text) sent!")
     else:
         print("Failed to send status report")
+        # Non-zero exit so systemd OnFailure fires — otherwise the daily
+        # digest silently drops when Telegram is unreachable.
+        sys.exit(1)
 
 
 def backup_state():
@@ -1081,6 +1088,7 @@ def backup_state():
         print(f"Backup sent: {filename}")
     else:
         print("Failed to send backup")
+        sys.exit(1)
 
 
 def main():

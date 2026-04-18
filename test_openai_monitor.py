@@ -490,6 +490,18 @@ class CheckAndAlertTests(StateIsolationMixin, unittest.TestCase):
         self.assertIsNone(result)
         mock_tg.assert_not_called()
 
+    def test_telegram_failure_raises_systemexit(self):
+        # When balance is below threshold and Telegram fails → sys.exit(1)
+        # so systemd OnFailure fires instead of silently dropping the alert.
+        self.write_state({"total_deposited": 1000, "alert_threshold": 100})
+        with patch("openai_monitor.get_total_costs", return_value=(950.0, None)), \
+             patch("openai_monitor.get_today_costs", return_value=1.0), \
+             patch("openai_monitor.get_billing_balance", return_value=None), \
+             patch("openai_monitor.send_telegram_alert", return_value=False):
+            with self.assertRaises(SystemExit) as cm:
+                openai_monitor.check_and_alert()
+            self.assertEqual(cm.exception.code, 1)
+
     def test_billing_source_bypasses_manual_formula(self):
         self.write_state({"total_deposited": 1000, "alert_threshold": 100})
         with patch("openai_monitor.get_billing_balance",
@@ -582,6 +594,18 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
         mock_msg.assert_not_called()
         mock_costs.assert_not_called()
         mock_tg.assert_not_called()
+
+    def test_raises_systemexit_when_both_photo_and_text_fail(self):
+        self.write_state({"total_deposited": 150, "alert_threshold": 100,
+                          "topup_history": []})
+        patches = self._common_patches()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+             patch("charts.build_status_chart", return_value=b"\x89PNG"), \
+             patch("openai_monitor.send_telegram_photo", return_value=False), \
+             patch("openai_monitor.send_telegram_alert", return_value=False):
+            with self.assertRaises(SystemExit) as cm:
+                openai_monitor.send_status_report()
+            self.assertEqual(cm.exception.code, 1)
 
 
 # ───────────────────────────────── main routing ────────────────────────────────
@@ -778,6 +802,13 @@ class BackupStateTests(StateIsolationMixin, unittest.TestCase):
         with patch("openai_monitor.send_telegram_document") as mock_send:
             openai_monitor.backup_state()
         mock_send.assert_not_called()
+
+    def test_raises_systemexit_when_telegram_fails(self):
+        self.write_state({"x": 1})
+        with patch("openai_monitor.send_telegram_document", return_value=False):
+            with self.assertRaises(SystemExit) as cm:
+                openai_monitor.backup_state()
+            self.assertEqual(cm.exception.code, 1)
 
     def test_filename_contains_timestamp(self):
         self.write_state({"x": 1})
