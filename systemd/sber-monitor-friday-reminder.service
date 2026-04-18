@@ -1,0 +1,12 @@
+[Unit]
+Description=Sber Friday morning reminder — don't let money sit over the weekend
+After=network-online.target
+Wants=network-online.target
+OnFailure=monitor-alert@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/openai_monitor
+ExecStart=/usr/bin/python3 /opt/openai_monitor/sber_monitor.py --friday-reminder
+# Env comes from same drop-in as final-warning (env.conf + onfailure.conf).
+# See systemd/drop-ins/sber-monitor-friday-reminder.env.conf for the template.

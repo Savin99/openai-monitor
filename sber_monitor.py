@@ -374,13 +374,20 @@ def check_and_alert(force_refresh=False):
         print("Missing env vars: " + ", ".join(missing))
         return
 
+    now = now_in_alert_tz()
+
+    # Weekend: биржа закрыта, деньги положить нельзя → не шлём ничего.
+    # Даже не ходим в API за балансами.
+    if now.weekday() >= 5:
+        print(f"Weekend ({now.strftime('%A')}) — skip check_and_alert entirely")
+        return
+
     access_token, tokens = get_valid_access_token(force_refresh=force_refresh)
     check_refresh_token_expiry(tokens)
 
     raw_accounts = get_client_accounts(access_token)
     accounts = filter_rub_current_accounts(raw_accounts)
 
-    now = now_in_alert_tz()
     statement_date = now.strftime("%Y-%m-%d")
     accounts = enrich_with_balances(access_token, accounts, statement_date)
 
@@ -521,17 +528,36 @@ def send_final_warning():
         above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>")
 
     hours_left = max(0, CONFIG["alert_hour_end"] + 1 - now.hour)
+    is_friday = now.weekday() == 4
+
+    if is_friday:
+        header = (
+            f"🔴🔴🔴 <b>ПЯТНИЦА — ПОСЛЕДНИЙ ШАНС</b> 🔴🔴🔴\n"
+            f"{now.strftime('%H:%M')} {CONFIG['alert_timezone']}\n\n"
+            f"Не положишь сейчас → <b>3 дня простоя</b> (сб, вс + пн утром).\n"
+            f"Каждый день без депозита — упущенный процент.\n"
+        )
+        footer = (
+            "<i>Пятница — ключевой день. Положи депозит, "
+            "иначе деньги провалятся все выходные.</i>"
+        )
+    else:
+        header = (
+            f"☠️ <b>ПОСЛЕДНИЙ ЗВОНОК — {now.strftime('%H:%M')} "
+            f"{CONFIG['alert_timezone']}</b>\n\n"
+            f"До закрытия окна: <b>{hours_left} ч.</b>\n"
+            f"Каждый час без депозита — упущенный процент.\n"
+        )
+        footer = (
+            "<i>Положи сейчас — или ночь деньги лежат мёртвым грузом.</i>"
+        )
 
     message = (
-        f"☠️ <b>ПОСЛЕДНИЙ ЗВОНОК — {now.strftime('%H:%M')} "
-        f"{CONFIG['alert_timezone']}</b>\n\n"
-        f"До закрытия окна: <b>{hours_left} ч.</b>\n"
-        f"Каждый час без депозита — упущенный процент.\n\n"
-        f"<b>Всё ещё выше порога {threshold_str} ₽:</b>\n"
-        + "\n".join(above_lines)
-        + "\n"
+        header + "\n"
+        + f"<b>Всё ещё выше порога {threshold_str} ₽:</b>\n"
+        + "\n".join(above_lines) + "\n"
         + "<pre>" + FINAL_WARNING_ART + "</pre>\n"
-        + "<i>Положи сейчас — или ночь деньги лежат мёртвым грузом.</i>"
+        + footer
     )
     if _alert(message):
         print(f"Final warning sent at {now.strftime('%Y-%m-%dT%H:%M')}")
@@ -539,6 +565,73 @@ def send_final_warning():
         save_sber_state(sber_state)
     else:
         print("Failed to send final warning")
+
+
+def send_friday_morning_reminder():
+    """Friday 10:00 MSK heads-up: if RC balance is above threshold, nudge
+    early so there's time to move it before close. If not acted on, the
+    weekend eats 3 days of interest.
+
+    - Weekday gate: only on Fridays (weekday()==4). Other days = silent.
+    - Once per Friday: sber.last_friday_reminder_date in state.
+    - Silent if nothing is above threshold.
+    """
+    missing = [
+        k for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
+        if not CONFIG[k]
+    ]
+    if missing:
+        print("Missing env vars: " + ", ".join(missing))
+        return
+
+    now = now_in_alert_tz()
+    if now.weekday() != 4:
+        print(f"Not Friday ({now.strftime('%A')}) — skip friday reminder")
+        return
+
+    today_str = now.strftime("%Y-%m-%d")
+    sber_state = get_sber_state()
+    if sber_state.get("last_friday_reminder_date") == today_str:
+        print(f"Friday reminder already sent today ({today_str}), skip")
+        return
+
+    access_token, tokens = get_valid_access_token()
+    check_refresh_token_expiry(tokens)
+    raw_accounts = get_client_accounts(access_token)
+    accounts = filter_rub_current_accounts(raw_accounts)
+    accounts = enrich_with_balances(access_token, accounts, today_str)
+
+    threshold = CONFIG["balance_threshold"]
+    above = [a for a in accounts if a.get("balance", 0) > threshold]
+    if not above:
+        print("Friday reminder skipped — no accounts above threshold")
+        return
+
+    threshold_str = f"{threshold:,.0f}".replace(",", " ")
+    above_lines = []
+    for a in above:
+        label = account_label(a.get("accountNumber"))
+        balance_str = f"{a['balance']:,.2f}".replace(",", " ")
+        above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>")
+
+    message = (
+        f"☕ <b>Пятница — напоминание</b>\n"
+        f"{now.strftime('%H:%M')} {CONFIG['alert_timezone']}\n\n"
+        f"Если не положишь депозит сегодня — <b>3 дня простоя</b> "
+        f"(сб + вс + пн утром).\n"
+        f"Окно для перевода: до 20:00 MSK. У тебя есть "
+        f"{max(0, 20 - now.hour)} ч, успеваешь в банк/звонок.\n\n"
+        f"<b>Выше порога {threshold_str} ₽:</b>\n"
+        + "\n".join(above_lines)
+        + "\n\n<i>Это утренний пинг — вечером придёт последний звонок.</i>"
+    )
+
+    if _alert(message):
+        print(f"Friday reminder sent at {now.strftime('%Y-%m-%dT%H:%M')}")
+        sber_state["last_friday_reminder_date"] = today_str
+        save_sber_state(sber_state)
+    else:
+        print("Failed to send friday reminder")
 
 
 def send_status():
@@ -566,6 +659,8 @@ def main():
         send_status()
     elif "--final-warning" in args:
         send_final_warning()
+    elif "--friday-reminder" in args:
+        send_friday_morning_reminder()
     elif "--force-refresh" in args:
         check_and_alert(force_refresh=True)
     else:

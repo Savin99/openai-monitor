@@ -206,14 +206,14 @@ class CheckAndAlertTests(unittest.TestCase):
 
     def test_all_accounts_under_threshold_no_alert(self):
         # Два счёта, оба под 5М — тишина
-        now = datetime(2026, 4, 18, 16, 30, tzinfo=self.TZ)
+        now = datetime(2026, 4, 15, 16, 30, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[4_000_000, 900_000], fake_now=now)
         mock_alert.assert_not_called()
         self.assertIsNone(sber.get("last_alert_hour"))
 
     def test_one_account_above_triggers_alert(self):
         # Второй счёт выше 5М → алерт, в сообщении только один номер счёта
-        now = datetime(2026, 4, 18, 15, 0, tzinfo=self.TZ)
+        now = datetime(2026, 4, 15, 15, 0, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[2_000_000, 7_500_000], fake_now=now)
         mock_alert.assert_called_once()
         msg = mock_alert.call_args[0][0]
@@ -221,49 +221,50 @@ class CheckAndAlertTests(unittest.TestCase):
         self.assertIn("7 500 000", msg)
         # Первый счёт не должен быть в списке превышений
         self.assertNotIn("2 000 000", msg.split("Превышение")[1])
-        self.assertEqual(sber["last_alert_hour"], "2026-04-18T15")
+        self.assertEqual(sber["last_alert_hour"], "2026-04-15T15")
 
     def test_exactly_at_threshold_no_alert(self):
         # Ровно 5М — не алерт (проверка строго > threshold)
-        now = datetime(2026, 4, 18, 16, 0, tzinfo=self.TZ)
+        now = datetime(2026, 4, 15, 16, 0, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[5_000_000], fake_now=now)
         mock_alert.assert_not_called()
 
     def test_above_threshold_before_15_no_alert(self):
-        now = datetime(2026, 4, 18, 14, 59, tzinfo=self.TZ)
+        now = datetime(2026, 4, 15, 14, 59, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[6_000_000], fake_now=now)
         mock_alert.assert_not_called()
 
     def test_above_threshold_at_16_sends_another_alert(self):
         # В 15:00 уже алертили — в 16:00 должен прийти ещё один
         self._tmp_path.write_text(json.dumps({
-            "sber": {"last_alert_hour": "2026-04-18T15"}
+            "sber": {"last_alert_hour": "2026-04-15T15"}
         }))
-        now = datetime(2026, 4, 18, 16, 0, tzinfo=self.TZ)
+        now = datetime(2026, 4, 15, 16, 0, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[6_000_000], fake_now=now)
         mock_alert.assert_called_once()
-        self.assertEqual(sber["last_alert_hour"], "2026-04-18T16")
+        self.assertEqual(sber["last_alert_hour"], "2026-04-15T16")
 
     def test_not_duplicated_within_same_hour(self):
         self._tmp_path.write_text(json.dumps({
-            "sber": {"last_alert_hour": "2026-04-18T15"}
+            "sber": {"last_alert_hour": "2026-04-15T15"}
         }))
-        now = datetime(2026, 4, 18, 15, 10, tzinfo=self.TZ)
+        now = datetime(2026, 4, 15, 15, 10, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[6_000_000], fake_now=now)
         mock_alert.assert_not_called()
-        self.assertEqual(sber["last_alert_hour"], "2026-04-18T15")
+        self.assertEqual(sber["last_alert_hour"], "2026-04-15T15")
 
     def test_after_23_no_alert(self):
-        now_midnight = datetime(2026, 4, 19, 0, 30, tzinfo=self.TZ)
+        # 2026-04-16 00:30 — ночь среда→четверг, после окончания окна в 23:59 ср
+        now_midnight = datetime(2026, 4, 16, 0, 30, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[6_000_000], fake_now=now_midnight)
         mock_alert.assert_not_called()
 
     def test_balance_drop_clears_alert_state(self):
         # Пре-заполняем, что уже был алерт — все счета упали под порог
         self._tmp_path.write_text(json.dumps({
-            "sber": {"last_alert_hour": "2026-04-18T15"}
+            "sber": {"last_alert_hour": "2026-04-15T15"}
         }))
-        now = datetime(2026, 4, 18, 16, 0, tzinfo=self.TZ)
+        now = datetime(2026, 4, 15, 16, 0, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[4_000_000, 500_000], fake_now=now)
         mock_alert.assert_not_called()
         self.assertIsNone(sber["last_alert_hour"])
@@ -271,36 +272,58 @@ class CheckAndAlertTests(unittest.TestCase):
     def test_hourly_pattern_entire_evening(self):
         # С 15 до 20 — 6 алертов, если хотя бы на одном счёте всё ещё выше 5М
         for hour in range(15, 21):
-            now = datetime(2026, 4, 18, hour, 0, tzinfo=self.TZ)
+            now = datetime(2026, 4, 15, hour, 0, tzinfo=self.TZ)
             mock_alert, sber = self._run(balances=[6_000_000], fake_now=now)
             mock_alert.assert_called_once()
-            self.assertEqual(sber["last_alert_hour"], f"2026-04-18T{hour:02d}")
+            self.assertEqual(sber["last_alert_hour"], f"2026-04-15T{hour:02d}")
+
+    def test_weekend_skip_saturday(self):
+        # Saturday 2026-04-25 — no alert even if above threshold
+        now = datetime(2026, 4, 25, 16, 30, tzinfo=self.TZ)
+        with patch.object(sber_monitor, "get_valid_access_token") as mock_tok, \
+             patch.object(sber_monitor, "_alert") as mock_alert, \
+             patch.object(sber_monitor, "now_in_alert_tz", return_value=now):
+            sber_monitor.check_and_alert()
+        # Weekend guard must short-circuit before any API call
+        mock_tok.assert_not_called()
+        mock_alert.assert_not_called()
+
+    def test_weekend_skip_sunday(self):
+        now = datetime(2026, 4, 26, 16, 30, tzinfo=self.TZ)
+        with patch.object(sber_monitor, "get_valid_access_token") as mock_tok, \
+             patch.object(sber_monitor, "_alert") as mock_alert, \
+             patch.object(sber_monitor, "now_in_alert_tz", return_value=now):
+            sber_monitor.check_and_alert()
+        mock_tok.assert_not_called()
+        mock_alert.assert_not_called()
 
     def test_re_alert_after_drop_and_rise_same_day(self):
         # 15:00 — алерт. 16:00 — положил, баланс упал. 17:00 — снова пришёл перевод,
         # баланс > порога → алерт ДОЛЖЕН прийти снова (защита от пропусков, глюков).
-        t15 = datetime(2026, 4, 18, 15, 0, tzinfo=self.TZ)
+        t15 = datetime(2026, 4, 15, 15, 0, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[6_000_000], fake_now=t15)
         mock_alert.assert_called_once()
-        self.assertEqual(sber["last_alert_hour"], "2026-04-18T15")
+        self.assertEqual(sber["last_alert_hour"], "2026-04-15T15")
 
         # 16:00 — положил, баланс упал
-        t16 = datetime(2026, 4, 18, 16, 0, tzinfo=self.TZ)
+        t16 = datetime(2026, 4, 15, 16, 0, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[1_000_000], fake_now=t16)
         mock_alert.assert_not_called()
         self.assertIsNone(sber["last_alert_hour"])
 
         # 17:00 — снова перевод, 7М на счёте → новый алерт
-        t17 = datetime(2026, 4, 18, 17, 0, tzinfo=self.TZ)
+        t17 = datetime(2026, 4, 15, 17, 0, tzinfo=self.TZ)
         mock_alert, sber = self._run(balances=[7_000_000], fake_now=t17)
         mock_alert.assert_called_once()
-        self.assertEqual(sber["last_alert_hour"], "2026-04-18T17")
+        self.assertEqual(sber["last_alert_hour"], "2026-04-15T17")
 
 
 class SendFinalWarningTests(unittest.TestCase):
     TZ = ZoneInfo("Europe/Moscow")
-    # Friday 2026-04-17 at 19:55 MSK — default weekday for these tests
-    WEEKDAY_NOW = datetime(2026, 4, 17, 19, 55, tzinfo=TZ)
+    # Thursday 2026-04-16 at 19:55 MSK — default non-Friday weekday.
+    # Friday-specific text is covered in a separate test below.
+    WEEKDAY_NOW = datetime(2026, 4, 16, 19, 55, tzinfo=TZ)
+    FRIDAY_NOW = datetime(2026, 4, 17, 19, 55, tzinfo=TZ)
 
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -361,6 +384,16 @@ class SendFinalWarningTests(unittest.TestCase):
         self.assertIn("7 500 000", msg)
         self.assertIn("R", msg)  # ASCII art marker (R.I.P)
         self.assertIn("<pre>", msg)
+        self.assertEqual(sber["last_final_warning_date"], "2026-04-16")
+
+    def test_friday_uses_three_day_emphasis(self):
+        # On Friday the text must switch to "ПЯТНИЦА" + "3 дня"
+        mock_alert, sber = self._run(balances=[7_500_000], now=self.FRIDAY_NOW)
+        mock_alert.assert_called_once()
+        msg = mock_alert.call_args.args[0]
+        self.assertIn("ПЯТНИЦА", msg)
+        self.assertIn("3 дня", msg)
+        self.assertNotIn("ПОСЛЕДНИЙ ЗВОНОК", msg)
         self.assertEqual(sber["last_final_warning_date"], "2026-04-17")
 
     def test_includes_hours_left_until_end_of_window(self):
@@ -385,28 +418,29 @@ class SendFinalWarningTests(unittest.TestCase):
         mock_alert.assert_not_called()
 
     def test_silent_on_saturday(self):
-        # 2026-04-18 is a Saturday
-        saturday = datetime(2026, 4, 18, 19, 55, tzinfo=self.TZ)
+        # 2026-04-25 is a Saturday
+        saturday = datetime(2026, 4, 25, 19, 55, tzinfo=self.TZ)
         mock_alert, _ = self._run(balances=[7_000_000], now=saturday)
         mock_alert.assert_not_called()
 
     def test_silent_on_sunday(self):
-        sunday = datetime(2026, 4, 19, 19, 55, tzinfo=self.TZ)
+        # 2026-04-26 is a Sunday
+        sunday = datetime(2026, 4, 26, 19, 55, tzinfo=self.TZ)
         mock_alert, _ = self._run(balances=[7_000_000], now=sunday)
         mock_alert.assert_not_called()
 
     def test_silent_if_already_sent_today(self):
-        self._seed_state(last_final_warning_date="2026-04-17")
+        self._seed_state(last_final_warning_date="2026-04-16")
         mock_alert, sber = self._run(balances=[7_000_000])
         mock_alert.assert_not_called()
         # state date preserved
-        self.assertEqual(sber["last_final_warning_date"], "2026-04-17")
+        self.assertEqual(sber["last_final_warning_date"], "2026-04-16")
 
     def test_sends_if_last_warning_was_yesterday(self):
-        self._seed_state(last_final_warning_date="2026-04-16")
+        self._seed_state(last_final_warning_date="2026-04-15")
         mock_alert, sber = self._run(balances=[7_000_000])
         mock_alert.assert_called_once()
-        self.assertEqual(sber["last_final_warning_date"], "2026-04-17")
+        self.assertEqual(sber["last_final_warning_date"], "2026-04-16")
 
     def test_does_not_mark_sent_if_telegram_fails(self):
         accounts = [
@@ -431,6 +465,136 @@ class SendFinalWarningTests(unittest.TestCase):
         import sys as _sys
         with patch.object(sber_monitor, "send_final_warning") as mock_fw, \
              patch.object(_sys, "argv", ["sber_monitor.py", "--final-warning"]):
+            sber_monitor.main()
+        mock_fw.assert_called_once()
+
+
+class SendFridayMorningReminderTests(unittest.TestCase):
+    TZ = ZoneInfo("Europe/Moscow")
+    FRIDAY_NOW = datetime(2026, 4, 17, 10, 0, tzinfo=TZ)
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self._tmp_path = Path(self._tmp.name) / "monitor_state.json"
+        self._patch_state_file = patch("utils.DEFAULT_STATE_FILE", self._tmp_path)
+        self._patch_state_file.start()
+
+        self._orig_config = dict(sber_monitor.CONFIG)
+        sber_monitor.CONFIG.update({
+            "client_id": "cid",
+            "client_secret": "csec",
+            "telegram_bot_token": "tok",
+            "telegram_chat_id": "42",
+            "balance_threshold": 5_000_000,
+            "alert_timezone": "Europe/Moscow",
+            "alert_hour_start": 15,
+            "alert_hour_end": 19,
+        })
+
+    def tearDown(self):
+        self._patch_state_file.stop()
+        sber_monitor.CONFIG.clear()
+        sber_monitor.CONFIG.update(self._orig_config)
+        self._tmp.cleanup()
+
+    def _run(self, balances, now=None):
+        if now is None:
+            now = self.FRIDAY_NOW
+        accounts = [
+            {"currencyCode": "RUB", "accountType": "CURRENT", "state": "OPEN",
+             "accountNumber": f"4080281000000000{i:04d}", "balance": b}
+            for i, b in enumerate(balances, start=1111)
+        ]
+        with patch.object(sber_monitor, "get_valid_access_token",
+                          return_value=("tok", {"refresh_issued_at": int(time.time())})), \
+             patch.object(sber_monitor, "get_client_accounts", return_value=accounts), \
+             patch.object(sber_monitor, "enrich_with_balances",
+                          side_effect=lambda t, a, d: a), \
+             patch.object(sber_monitor, "check_refresh_token_expiry"), \
+             patch.object(sber_monitor, "_alert", return_value=True) as mock_alert, \
+             patch.object(sber_monitor, "now_in_alert_tz", return_value=now):
+            sber_monitor.send_friday_morning_reminder()
+        state = json.loads(self._tmp_path.read_text()) if self._tmp_path.exists() else {}
+        return mock_alert, state.get("sber", {})
+
+    def test_sends_on_friday_when_above(self):
+        mock_alert, sber = self._run(balances=[7_500_000])
+        mock_alert.assert_called_once()
+        msg = mock_alert.call_args.args[0]
+        self.assertIn("Пятница", msg)
+        self.assertIn("3 дня простоя", msg)
+        self.assertIn("7 500 000", msg)
+        self.assertEqual(sber["last_friday_reminder_date"], "2026-04-17")
+
+    def test_silent_on_friday_when_all_under(self):
+        mock_alert, sber = self._run(balances=[3_000_000, 1_000_000])
+        mock_alert.assert_not_called()
+        self.assertNotIn("last_friday_reminder_date", sber)
+
+    def test_silent_on_non_friday_thursday(self):
+        thursday = datetime(2026, 4, 16, 10, 0, tzinfo=self.TZ)
+        with patch.object(sber_monitor, "get_valid_access_token") as mock_tok, \
+             patch.object(sber_monitor, "_alert") as mock_alert, \
+             patch.object(sber_monitor, "now_in_alert_tz", return_value=thursday):
+            sber_monitor.send_friday_morning_reminder()
+        mock_tok.assert_not_called()
+        mock_alert.assert_not_called()
+
+    def test_silent_on_saturday(self):
+        saturday = datetime(2026, 4, 25, 10, 0, tzinfo=self.TZ)
+        with patch.object(sber_monitor, "get_valid_access_token") as mock_tok, \
+             patch.object(sber_monitor, "_alert") as mock_alert, \
+             patch.object(sber_monitor, "now_in_alert_tz", return_value=saturday):
+            sber_monitor.send_friday_morning_reminder()
+        mock_tok.assert_not_called()
+        mock_alert.assert_not_called()
+
+    def test_silent_if_already_sent_today(self):
+        self._tmp_path.write_text(json.dumps({
+            "sber": {"last_friday_reminder_date": "2026-04-17"}
+        }))
+        mock_alert, sber = self._run(balances=[7_000_000])
+        mock_alert.assert_not_called()
+        self.assertEqual(sber["last_friday_reminder_date"], "2026-04-17")
+
+    def test_sends_if_last_reminder_was_previous_friday(self):
+        self._tmp_path.write_text(json.dumps({
+            "sber": {"last_friday_reminder_date": "2026-04-10"}
+        }))
+        mock_alert, sber = self._run(balances=[7_000_000])
+        mock_alert.assert_called_once()
+        self.assertEqual(sber["last_friday_reminder_date"], "2026-04-17")
+
+    def test_missing_env_aborts(self):
+        sber_monitor.CONFIG["telegram_bot_token"] = ""
+        with patch.object(sber_monitor, "get_valid_access_token") as mock_tok, \
+             patch.object(sber_monitor, "_alert") as mock_alert:
+            sber_monitor.send_friday_morning_reminder()
+        mock_tok.assert_not_called()
+        mock_alert.assert_not_called()
+
+    def test_does_not_mark_sent_if_telegram_fails(self):
+        accounts = [
+            {"currencyCode": "RUB", "accountType": "CURRENT", "state": "OPEN",
+             "accountNumber": "40802810111111111111", "balance": 7_000_000}
+        ]
+        with patch.object(sber_monitor, "get_valid_access_token",
+                          return_value=("tok", {"refresh_issued_at": int(time.time())})), \
+             patch.object(sber_monitor, "get_client_accounts", return_value=accounts), \
+             patch.object(sber_monitor, "enrich_with_balances",
+                          side_effect=lambda t, a, d: a), \
+             patch.object(sber_monitor, "check_refresh_token_expiry"), \
+             patch.object(sber_monitor, "_alert", return_value=False), \
+             patch.object(sber_monitor, "now_in_alert_tz",
+                          return_value=self.FRIDAY_NOW):
+            sber_monitor.send_friday_morning_reminder()
+        state = json.loads(self._tmp_path.read_text()) if self._tmp_path.exists() else {}
+        self.assertNotIn("last_friday_reminder_date", state.get("sber", {}))
+
+    def test_cli_flag_routes(self):
+        import sys as _sys
+        with patch.object(sber_monitor, "send_friday_morning_reminder") as mock_fw, \
+             patch.object(_sys, "argv", ["sber_monitor.py", "--friday-reminder"]):
             sber_monitor.main()
         mock_fw.assert_called_once()
 

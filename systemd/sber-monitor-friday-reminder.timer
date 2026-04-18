@@ -1,0 +1,12 @@
+[Unit]
+Description=Sber Friday morning reminder — only on Fridays at 10:00 MSK (07:00 UTC)
+
+[Timer]
+# systemd understands day-of-week in OnCalendar. Fri only.
+OnCalendar=Fri *-*-* 07:00:00 UTC
+AccuracySec=1min
+Persistent=true
+Unit=sber-monitor-friday-reminder.service
+
+[Install]
+WantedBy=timers.target
