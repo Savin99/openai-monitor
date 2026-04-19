@@ -1,0 +1,11 @@
+[Unit]
+Description=Run selectel-monitor every hour
+
+[Timer]
+OnCalendar=*-*-* *:00:00
+AccuracySec=1min
+Persistent=true
+Unit=selectel-monitor-check.service
+
+[Install]
+WantedBy=timers.target

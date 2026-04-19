@@ -13,6 +13,8 @@
 | `monitor-watchdog.service` | `/etc/systemd/system/monitor-watchdog.service` |
 | `monitor-watchdog.timer` | `/etc/systemd/system/monitor-watchdog.timer` |
 | `monitor-telegram.example` | (только пример) На VPS руками создать `/etc/default/monitor-telegram` с реальными значениями, `chmod 600`. |
+| `selectel-monitor-check.service` | `/etc/systemd/system/selectel-monitor-check.service` |
+| `selectel-monitor-check.timer` | `/etc/systemd/system/selectel-monitor-check.timer` |
 | `drop-ins/<unit>.override.conf` | `/etc/systemd/system/<unit>.d/override.conf` |
 
 ## Логика
@@ -52,11 +54,19 @@ mkdir -p /etc/systemd/system/actions.runner.Savin99-openai-monitor.vds-openai-mo
 install -m 644 drop-ins/actions.runner.override.conf \
   /etc/systemd/system/actions.runner.Savin99-openai-monitor.vds-openai-monitor.service.d/override.conf
 
-# 5. activate
+# 5. selectel-monitor (если ещё не установлен)
+install -m 644 selectel-monitor-check.service /etc/systemd/system/
+install -m 644 selectel-monitor-check.timer /etc/systemd/system/
+# (предварительно: pip install google-auth google-auth-oauthlib google-api-python-client,
+#  scp gmail_token.json + gmail_credentials.json в /opt/openai_monitor/, и подставить
+#  TELEGRAM_* в Environment= внутри selectel-monitor-check.service)
+systemctl enable --now selectel-monitor-check.timer
+
+# 6. activate watchdog
 systemctl daemon-reload
 systemctl enable --now monitor-watchdog.timer
 
-# 6. smoke test — сымитировать падение
+# 7. smoke test — сымитировать падение
 systemctl start monitor-alert@fake-unit.service   # должно прислать Telegram
 ```
 

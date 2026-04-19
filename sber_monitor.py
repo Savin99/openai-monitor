@@ -70,7 +70,7 @@ CONFIG = {
     "balance_threshold": float(os.environ.get("SBER_RC_BALANCE_THRESHOLD", "5000000")),
     "alert_timezone": os.environ.get("SBER_ALERT_TIMEZONE", "Europe/Moscow"),
     "alert_hour_start": int(os.environ.get("SBER_ALERT_HOUR_START", "15")),
-    "alert_hour_end": int(os.environ.get("SBER_ALERT_HOUR_END", "23")),
+    "alert_hour_end": int(os.environ.get("SBER_ALERT_HOUR_END", "19")),
     "account_labels": _parse_labels(os.environ.get("SBER_ACCOUNT_LABELS", "")),
     "client_cert_file": os.environ.get("SBER_CLIENT_CERT_FILE", ""),
     "client_key_file": os.environ.get("SBER_CLIENT_KEY_FILE", ""),

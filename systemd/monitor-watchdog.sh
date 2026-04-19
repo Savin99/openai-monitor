@@ -33,6 +33,7 @@ ACTIVE_UNITS=(
   "sber-monitor-check.timer"
   "sber-monitor-final-warning.timer"
   "sber-monitor-friday-reminder.timer"
+  "selectel-monitor-check.timer"
   "actions.runner.Savin99-openai-monitor.vds-openai-monitor.service"
 )
 
@@ -57,6 +58,7 @@ declare -A MAX_AGE=(
                                           #  generous 24h because weekends skip
   ["sber-monitor-final-warning"]=259200  # daily on weekdays → 3 days across weekend
   ["sber-monitor-friday-reminder"]=691200 # weekly → 8 days
+  ["selectel-monitor-check"]=5400        # hourly  +  slack → 1.5h
 )
 
 HEARTBEAT_DIR=/var/lib/monitor/heartbeat

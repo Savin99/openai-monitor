@@ -1,0 +1,16 @@
+[Unit]
+Description=Selectel email monitor — forward no-reply@selectel.ru notifications to Telegram
+After=network-online.target
+Wants=network-online.target
+OnFailure=monitor-alert@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/openai_monitor
+Environment=GMAIL_SENDER_FILTER=no-reply@selectel.ru
+Environment=GMAIL_LOOKBACK=2d
+Environment=SELECTEL_BODY_PREVIEW_LEN=500
+Environment=SELECTEL_SERVICE_LABEL=Selectel
+Environment=TELEGRAM_BOT_TOKEN=REPLACE_ME
+Environment=TELEGRAM_CHAT_ID=REPLACE_ME
+ExecStart=/usr/bin/python3 /opt/openai_monitor/selectel_monitor.py

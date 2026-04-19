@@ -6,5 +6,7 @@ sber_client*.p12
 sber_client*.pem
 sber_client*.key
 sber_ca_bundle.pem
+gmail_token.json
+gmail_credentials.json
 *.pyc
 CLAUDE.md
