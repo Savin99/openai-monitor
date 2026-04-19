@@ -22,7 +22,9 @@
 ## Логика
 
 1. **`monitor-alert@<unit>.service`** — шаблон-сервис. Любой критичный юнит с `OnFailure=monitor-alert@%n.service` при падении автоматически стартует `monitor-alert@<своё-имя>.service`, который вызывает `monitor-alert.sh <имя>` → Telegram.
-2. **`monitor-watchdog.timer`** — каждые 15 мин. Проверяет `systemctl is-active` для списка критичных юнитов. Если хоть один не `active` — алерт. Защищает от «тихих» inactive случаев.
+2. **`monitor-watchdog.timer`** — каждые 15 мин. Проверяет `systemctl is-active` для списка критичных юнитов и свежесть heartbeat-файлов в `/var/lib/monitor/heartbeat/`. Если хоть что-то не так — Telegram-алерт. Защищает от «тихих» inactive случаев и «зомби» юнитов которые active, но молча не работают.
+
+   **Внешний pinger (healthchecks.io)** — если в `/etc/default/monitor-telegram` задан `HEALTHCHECKS_URL=https://hc-ping.com/<uuid>`, watchdog после успешной проверки делает GET на этот URL, при провале — на `<URL>/fail`. Healthchecks.io независимо мониторит «приходят ли пинги вовремя» и шлёт алерт по своим каналам (email/Telegram-через-их-бот). **Зачем**: если упадёт сам VPS целиком, watchdog лежит вместе с ним → собственные алерты не доходят. Внешний pinger это видит снаружи и алертит. Закрывает TODO «внешний pinger».
 3. **Drop-in overrides** — добавляют `OnFailure=` на critical юниты без правки оригинала:
    - `openai-monitor.service` (бот): + `Restart=always`, `StartLimitIntervalSec=0` (без штрафного лимита)
    - `openai-monitor-check.service`, `openai-monitor-status.service`, `sber-monitor-check.service`: только `OnFailure`

@@ -83,10 +83,23 @@ for unit in "${!MAX_AGE[@]}"; do
   fi
 done
 
+# ── healthchecks.io ping ──────────────────────────────────────────────────────
+# External liveness signal — survives full-VPS outages (when watchdog itself
+# can't deliver anything). HC alerts via its own channels (email/Telegram).
+# Set HEALTHCHECKS_URL=https://hc-ping.com/<uuid> in /etc/default/monitor-telegram.
+hc_ping() {
+  local suffix="$1"   # empty for success, "/fail" for failure
+  [[ -z "${HEALTHCHECKS_URL:-}" ]] && return 0
+  curl -fsS -m 10 --retry 3 --retry-connrefused \
+    "${HEALTHCHECKS_URL}${suffix}" >/dev/null 2>&1 || true
+}
+
 # ── report ────────────────────────────────────────────────────────────────────
 if [[ ${#inactive[@]} -eq 0 && ${#stale[@]} -eq 0 ]]; then
+  hc_ping ""
   exit 0
 fi
+hc_ping "/fail"
 
 host="$(hostname)"
 ts_str="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"

@@ -4,3 +4,8 @@
 
 TELEGRAM_BOT_TOKEN=REPLACE_ME
 TELEGRAM_CHAT_ID=REPLACE_ME
+
+# External liveness pinger (https://healthchecks.io). Optional but recommended:
+# protects against full-VPS outages where the watchdog itself can't deliver
+# alerts. Watchdog hits the URL on success and <URL>/fail on any problem.
+HEALTHCHECKS_URL=https://hc-ping.com/REPLACE_ME-with-real-uuid
