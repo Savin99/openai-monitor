@@ -309,5 +309,116 @@ class ForwardNewTests(unittest.TestCase):
         self.assertEqual(ids, ["id-2", "id-1", "id-0"])
 
 
+class LoadImageBytesTests(unittest.TestCase):
+    def test_returns_none_when_path_empty(self):
+        self.assertIsNone(selectel_monitor._load_image_bytes(""))
+        self.assertIsNone(selectel_monitor._load_image_bytes(None))
+
+    def test_returns_none_when_file_missing(self):
+        self.assertIsNone(selectel_monitor._load_image_bytes("/no/such/file.png"))
+
+    def test_returns_bytes_when_file_exists(self):
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / "img.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+            data = selectel_monitor._load_image_bytes(str(p))
+            self.assertIsInstance(data, bytes)
+            self.assertTrue(data.startswith(b"\x89PNG"))
+
+
+class SendStatusTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self._tmp_path = Path(self._tmp.name) / "monitor_state.json"
+        self._patch_state = patch("utils.DEFAULT_STATE_FILE", self._tmp_path)
+        self._patch_state.start()
+
+        self._orig_config = dict(selectel_monitor.CONFIG)
+        selectel_monitor.CONFIG.update({
+            "telegram_bot_token": "test_token",
+            "telegram_chat_id": "12345",
+            "sender_filter": "no-reply@selectel.ru",
+            "lookback": "2d",
+            "service_label": "Selectel",
+            "instance": "selectel",
+        })
+
+    def tearDown(self):
+        self._patch_state.stop()
+        selectel_monitor.CONFIG.clear()
+        selectel_monitor.CONFIG.update(self._orig_config)
+        self._tmp.cleanup()
+
+    def test_reports_counts_and_uses_instance_bucket(self):
+        gmail = _build_fake_gmail({
+            "id-1": {"payload": {"headers": [], "mimeType": "text/plain", "body": {}}},
+            "id-2": {"payload": {"headers": [], "mimeType": "text/plain", "body": {}}},
+        })
+        # Mark id-1 as already processed → new_count=1.
+        self._tmp_path.write_text(json.dumps({
+            "selectel": {"processed_message_ids": ["id-1"]}
+        }))
+
+        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
+             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
+             patch.object(selectel_monitor, "send_telegram_alert", return_value=True) as send:
+            selectel_monitor.send_status()
+
+        send.assert_called_once()
+        msg = send.call_args[0][0]
+        self.assertIn("Найдено писем: 2", msg)
+        self.assertIn("Из них новых: 1", msg)
+
+    def test_telegram_fail_exits(self):
+        gmail = _build_fake_gmail({})
+        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
+             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
+             patch.object(selectel_monitor, "send_telegram_alert", return_value=False):
+            with self.assertRaises(SystemExit) as cm:
+                selectel_monitor.send_status()
+            self.assertEqual(cm.exception.code, 1)
+
+
+class MainDispatchTests(unittest.TestCase):
+    """main() routes to forward_new/send_status and writes instance-named heartbeat."""
+
+    def setUp(self):
+        self._orig_config = dict(selectel_monitor.CONFIG)
+        selectel_monitor.CONFIG["instance"] = "vdska"
+
+    def tearDown(self):
+        selectel_monitor.CONFIG.clear()
+        selectel_monitor.CONFIG.update(self._orig_config)
+
+    def test_default_calls_forward_new_then_heartbeat(self):
+        with patch.object(selectel_monitor, "forward_new") as fn, \
+             patch.object(selectel_monitor, "send_status") as ss, \
+             patch.object(selectel_monitor, "touch_heartbeat") as hb, \
+             patch.object(selectel_monitor.sys, "argv", ["selectel_monitor.py"]):
+            selectel_monitor.main()
+        fn.assert_called_once()
+        ss.assert_not_called()
+        hb.assert_called_once_with("vdska-monitor-check")
+
+    def test_status_flag_calls_send_status(self):
+        with patch.object(selectel_monitor, "forward_new") as fn, \
+             patch.object(selectel_monitor, "send_status") as ss, \
+             patch.object(selectel_monitor, "touch_heartbeat") as hb, \
+             patch.object(selectel_monitor.sys, "argv", ["selectel_monitor.py", "--status"]):
+            selectel_monitor.main()
+        ss.assert_called_once()
+        fn.assert_not_called()
+        hb.assert_called_once_with("vdska-monitor-check")
+
+    def test_heartbeat_skipped_on_systemexit(self):
+        """If forward_new raises SystemExit (Telegram fail), heartbeat is NOT written."""
+        with patch.object(selectel_monitor, "forward_new", side_effect=SystemExit(1)), \
+             patch.object(selectel_monitor, "touch_heartbeat") as hb, \
+             patch.object(selectel_monitor.sys, "argv", ["selectel_monitor.py"]):
+            with self.assertRaises(SystemExit):
+                selectel_monitor.main()
+        hb.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
