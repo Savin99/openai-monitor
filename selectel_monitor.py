@@ -41,8 +41,13 @@ log = logging.getLogger("selectel-monitor")
 
 SCRIPT_DIR = Path(__file__).parent
 TOKEN_FILE = SCRIPT_DIR / "gmail_token.json"
-DEFAULT_IMAGE = SCRIPT_DIR / "assets" / "selectel.png"
+ASSETS_DIR = SCRIPT_DIR / "assets"
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+# MONITOR_INSTANCE_NAME identifies *which* sender this run is for. It picks
+# the state-bucket key and heartbeat unit name, so the same script can serve
+# multiple Gmail-forward unit files (selectel, vdska, …) without colliding.
+INSTANCE = os.environ.get("MONITOR_INSTANCE_NAME", "selectel")
 
 CONFIG = {
     "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
@@ -52,7 +57,8 @@ CONFIG = {
     "body_preview_len": int(os.environ.get("SELECTEL_BODY_PREVIEW_LEN", "500")),
     "service_label": os.environ.get("SELECTEL_SERVICE_LABEL", "Selectel"),
     "max_processed_ids": int(os.environ.get("SELECTEL_MAX_PROCESSED_IDS", "200")),
-    "image_path": os.environ.get("SELECTEL_IMAGE_PATH", str(DEFAULT_IMAGE)),
+    "image_path": os.environ.get("SELECTEL_IMAGE_PATH", str(ASSETS_DIR / f"{INSTANCE}.png")),
+    "instance": INSTANCE,
 }
 
 
@@ -193,7 +199,7 @@ def _deliver(text, image_bytes):
             CONFIG["telegram_chat_id"],
             caption=text,
             parse_mode="HTML",
-            filename="selectel.png",
+            filename=f"{CONFIG['instance']}.png",
         )
         if ok:
             return True
@@ -208,8 +214,8 @@ def _deliver(text, image_bytes):
 def forward_new():
     """Main loop: fetch new messages from configured sender and forward to Telegram."""
     state = load_state()
-    selectel_state = state.setdefault("selectel", {})
-    processed = list(selectel_state.get("processed_message_ids", []))
+    instance_state = state.setdefault(CONFIG["instance"], {})
+    processed = list(instance_state.get("processed_message_ids", []))
     processed_set = set(processed)
 
     creds = _load_credentials()
@@ -237,7 +243,7 @@ def forward_new():
         # Trim FIFO so state file doesn't grow unbounded.
         if len(processed) > CONFIG["max_processed_ids"]:
             processed = processed[-CONFIG["max_processed_ids"]:]
-        selectel_state["processed_message_ids"] = processed
+        instance_state["processed_message_ids"] = processed
         save_state(state)
         print(f"Forwarded message {msg_id}: {msg.get('subject', '')[:60]}")
 
@@ -249,7 +255,7 @@ def send_status():
     ids = list_message_ids(service, CONFIG["sender_filter"], CONFIG["lookback"])
 
     state = load_state()
-    processed = state.get("selectel", {}).get("processed_message_ids", [])
+    processed = state.get(CONFIG["instance"], {}).get("processed_message_ids", [])
     processed_set = set(processed)
     new_count = sum(1 for i in ids if i not in processed_set)
 
@@ -278,7 +284,7 @@ def main():
         send_status()
     else:
         forward_new()
-    touch_heartbeat("selectel-monitor-check")
+    touch_heartbeat(f"{CONFIG['instance']}-monitor-check")
 
 
 if __name__ == "__main__":

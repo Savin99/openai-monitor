@@ -15,6 +15,8 @@
 | `monitor-telegram.example` | (только пример) На VPS руками создать `/etc/default/monitor-telegram` с реальными значениями, `chmod 600`. |
 | `selectel-monitor-check.service` | `/etc/systemd/system/selectel-monitor-check.service` |
 | `selectel-monitor-check.timer` | `/etc/systemd/system/selectel-monitor-check.timer` |
+| `vdska-monitor-check.service` | `/etc/systemd/system/vdska-monitor-check.service` |
+| `vdska-monitor-check.timer` | `/etc/systemd/system/vdska-monitor-check.timer` |
 | `drop-ins/<unit>.override.conf` | `/etc/systemd/system/<unit>.d/override.conf` |
 
 ## Логика
@@ -54,13 +56,15 @@ mkdir -p /etc/systemd/system/actions.runner.Savin99-openai-monitor.vds-openai-mo
 install -m 644 drop-ins/actions.runner.override.conf \
   /etc/systemd/system/actions.runner.Savin99-openai-monitor.vds-openai-monitor.service.d/override.conf
 
-# 5. selectel-monitor (если ещё не установлен)
-install -m 644 selectel-monitor-check.service /etc/systemd/system/
-install -m 644 selectel-monitor-check.timer /etc/systemd/system/
-# (предварительно: pip install google-auth google-auth-oauthlib google-api-python-client,
-#  scp gmail_token.json + gmail_credentials.json в /opt/openai_monitor/, и подставить
-#  TELEGRAM_* в Environment= внутри selectel-monitor-check.service)
-systemctl enable --now selectel-monitor-check.timer
+# 5. Gmail-forward мониторы (selectel + vdska, оба используют selectel_monitor.py)
+# Предварительно: pip install google-auth google-auth-oauthlib google-api-python-client,
+#                 scp gmail_token.json + gmail_credentials.json в /opt/openai_monitor/,
+#                 подставить TELEGRAM_* в Environment= внутри service-файлов
+for inst in selectel vdska; do
+  install -m 644 ${inst}-monitor-check.service /etc/systemd/system/
+  install -m 644 ${inst}-monitor-check.timer /etc/systemd/system/
+done
+systemctl enable --now selectel-monitor-check.timer vdska-monitor-check.timer
 
 # 6. activate watchdog
 systemctl daemon-reload

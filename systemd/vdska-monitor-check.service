@@ -1,0 +1,17 @@
+[Unit]
+Description=VDSka email monitor — forward support@vdska.ru notifications to Telegram
+After=network-online.target
+Wants=network-online.target
+OnFailure=monitor-alert@%N.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/openai_monitor
+Environment=MONITOR_INSTANCE_NAME=vdska
+Environment=GMAIL_SENDER_FILTER=support@vdska.ru
+Environment=GMAIL_LOOKBACK=2d
+Environment=SELECTEL_BODY_PREVIEW_LEN=500
+Environment=SELECTEL_SERVICE_LABEL=VDSka
+Environment=TELEGRAM_BOT_TOKEN=REPLACE_ME
+Environment=TELEGRAM_CHAT_ID=REPLACE_ME
+ExecStart=/usr/bin/python3 /opt/openai_monitor/selectel_monitor.py

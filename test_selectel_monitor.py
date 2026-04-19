@@ -137,6 +137,7 @@ class ForwardNewTests(unittest.TestCase):
             "max_processed_ids": 200,
             # Tests run without an image by default — flip per-test if needed.
             "image_path": str(Path(self._tmp.name) / "no-such-image.png"),
+            "instance": "selectel",
         })
 
     def tearDown(self):
@@ -261,6 +262,32 @@ class ForwardNewTests(unittest.TestCase):
 
         photo.assert_called_once()
         text.assert_called_once()
+
+    def test_instance_isolates_state_bucket(self):
+        """Two instances (selectel, vdska) should not share processed_ids."""
+        # Pre-populate state with vdska bucket → selectel run shouldn't see those.
+        self._tmp_path.write_text(json.dumps({
+            "vdska": {"processed_message_ids": ["id-A", "id-B"]},
+        }))
+        gmail = _build_fake_gmail({
+            "id-A": self._make_msg("Subj A", "body A"),
+        })
+
+        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
+             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
+             patch.object(selectel_monitor, "send_telegram_alert", return_value=True) as send:
+            selectel_monitor.forward_new()
+
+        # selectel saw it as new because its bucket was empty.
+        send.assert_called_once()
+        state = json.loads(self._tmp_path.read_text())
+        self.assertEqual(
+            state["selectel"]["processed_message_ids"], ["id-A"],
+        )
+        # vdska bucket untouched.
+        self.assertEqual(
+            state["vdska"]["processed_message_ids"], ["id-A", "id-B"],
+        )
 
     def test_processed_ids_fifo_trimmed(self):
         selectel_monitor.CONFIG["max_processed_ids"] = 3
