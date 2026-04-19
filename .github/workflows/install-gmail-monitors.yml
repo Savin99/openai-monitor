@@ -1,0 +1,22 @@
+name: Install Gmail monitors (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      healthchecks_url:
+        description: "BetterStack/healthchecks heartbeat URL (optional, blank to skip)"
+        required: false
+        default: ""
+
+jobs:
+  install:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run installer
+        env:
+          HEALTHCHECKS_URL: ${{ github.event.inputs.healthchecks_url }}
+        run: |
+          chmod +x scripts/install-gmail-monitors.sh
+          scripts/install-gmail-monitors.sh
