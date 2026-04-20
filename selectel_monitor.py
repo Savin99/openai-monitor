@@ -57,7 +57,9 @@ CONFIG = {
     "body_preview_len": int(os.environ.get("SELECTEL_BODY_PREVIEW_LEN", "500")),
     "service_label": os.environ.get("SELECTEL_SERVICE_LABEL", "Selectel"),
     "max_processed_ids": int(os.environ.get("SELECTEL_MAX_PROCESSED_IDS", "200")),
-    "image_path": os.environ.get("SELECTEL_IMAGE_PATH", str(ASSETS_DIR / f"{INSTANCE}.png")),
+    "image_path": os.environ.get(
+        "SELECTEL_IMAGE_PATH", str(ASSETS_DIR / f"{INSTANCE}.png")
+    ),
     "instance": INSTANCE,
 }
 
@@ -65,9 +67,7 @@ CONFIG = {
 def _load_credentials():
     """Read token, refresh if expired. Returns google.oauth2.credentials.Credentials."""
     if not TOKEN_FILE.exists():
-        raise FileNotFoundError(
-            f"{TOKEN_FILE} missing — run selectel_auth.py first"
-        )
+        raise FileNotFoundError(f"{TOKEN_FILE} missing — run selectel_auth.py first")
     creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
@@ -90,7 +90,17 @@ def _decode_b64url(data):
 
 
 def _strip_html(s):
-    # Strip tags, then collapse whitespace. Good enough for preview.
+    # Сначала вырезаем <style>…</style>, <script>…</script> и HTML-комментарии
+    # целиком — иначе их содержимое (CSS-правила, условные MSO-комменты) просочится
+    # сквозь обычный strip-tags и превратит письмо в мусор вроде
+    # «a {text-decoration: none;} sup { font-size: 100% !important; } …».
+    s = re.sub(
+        r"<(style|script)\b[^>]*>.*?</\1\s*>",
+        " ",
+        s,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    s = re.sub(r"<!--.*?-->", " ", s, flags=re.DOTALL)
     no_tags = re.sub(r"<[^>]+>", " ", s)
     unescaped = html.unescape(no_tags)
     return re.sub(r"\s+", " ", unescaped).strip()
@@ -137,9 +147,12 @@ def list_message_ids(service, sender, lookback):
     ids = []
     page_token = None
     while True:
-        resp = service.users().messages().list(
-            userId="me", q=q, pageToken=page_token, maxResults=50
-        ).execute()
+        resp = (
+            service.users()
+            .messages()
+            .list(userId="me", q=q, pageToken=page_token, maxResults=50)
+            .execute()
+        )
         for m in resp.get("messages", []):
             ids.append(m["id"])
         page_token = resp.get("nextPageToken")
@@ -150,9 +163,9 @@ def list_message_ids(service, sender, lookback):
 
 def fetch_message(service, msg_id):
     """Return dict {id, subject, from, date, body} for one message."""
-    raw = service.users().messages().get(
-        userId="me", id=msg_id, format="full"
-    ).execute()
+    raw = (
+        service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    )
     headers = raw.get("payload", {}).get("headers", [])
     return {
         "id": msg_id,
@@ -242,7 +255,7 @@ def forward_new():
         processed.append(msg_id)
         # Trim FIFO so state file doesn't grow unbounded.
         if len(processed) > CONFIG["max_processed_ids"]:
-            processed = processed[-CONFIG["max_processed_ids"]:]
+            processed = processed[-CONFIG["max_processed_ids"] :]
         instance_state["processed_message_ids"] = processed
         save_state(state)
         print(f"Forwarded message {msg_id}: {msg.get('subject', '')[:60]}")
@@ -276,7 +289,9 @@ def send_status():
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     args = sys.argv[1:]
     # heartbeat is reached only when the subcommand completes without
     # sys.exit(1) — watchdog uses the timestamp to spot silent liveness issues.

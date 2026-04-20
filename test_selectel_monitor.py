@@ -66,10 +66,11 @@ class ExtractBodyTests(unittest.TestCase):
         payload = {
             "mimeType": "multipart/alternative",
             "parts": [
-                {"mimeType": "text/html",
-                 "body": {"data": _b64url("<p>html version</p>")}},
-                {"mimeType": "text/plain",
-                 "body": {"data": _b64url("plain version")}},
+                {
+                    "mimeType": "text/html",
+                    "body": {"data": _b64url("<p>html version</p>")},
+                },
+                {"mimeType": "text/plain", "body": {"data": _b64url("plain version")}},
             ],
         }
         self.assertEqual(selectel_monitor._extract_body(payload), "plain version")
@@ -78,12 +79,41 @@ class ExtractBodyTests(unittest.TestCase):
         payload = {
             "mimeType": "multipart/alternative",
             "parts": [
-                {"mimeType": "text/html",
-                 "body": {"data": _b64url("<p>Hello <b>world</b></p>")}},
+                {
+                    "mimeType": "text/html",
+                    "body": {"data": _b64url("<p>Hello <b>world</b></p>")},
+                },
             ],
         }
         result = selectel_monitor._extract_body(payload)
         self.assertEqual(result, "Hello world")
+
+    def test_text_html_drops_style_and_script_contents(self):
+        # Регрессия: раньше strip-tags убирал только теги, а CSS/JS внутри
+        # <style>/<script> протекал в превью Telegram (Selectel-письма).
+        raw = (
+            "<html><head>"
+            "<style type='text/css'>a {text-decoration: none;} "
+            "#mshidden { display: none; }</style>"
+            "<script>var x = 1;</script>"
+            "</head><body><p>Пора пополнить баланс</p></body></html>"
+        )
+        payload = {
+            "mimeType": "text/html",
+            "body": {"data": _b64url(raw)},
+        }
+        result = selectel_monitor._extract_body(payload)
+        self.assertEqual(result, "Пора пополнить баланс")
+        self.assertNotIn("text-decoration", result)
+        self.assertNotIn("var x", result)
+
+    def test_text_html_drops_comments_including_mso_conditionals(self):
+        raw = (
+            "<!--[if mso]><style>table {border:0;}</style><![endif]-->"
+            "<p>Важный текст</p><!-- tracker -->"
+        )
+        payload = {"mimeType": "text/html", "body": {"data": _b64url(raw)}}
+        self.assertEqual(selectel_monitor._extract_body(payload), "Важный текст")
 
     def test_empty_payload(self):
         self.assertEqual(selectel_monitor._extract_body({}), "")
@@ -93,11 +123,15 @@ class ExtractBodyTests(unittest.TestCase):
         payload = {
             "mimeType": "multipart/mixed",
             "parts": [
-                {"mimeType": "multipart/alternative",
-                 "parts": [
-                     {"mimeType": "text/plain",
-                      "body": {"data": _b64url("nested plain")}},
-                 ]},
+                {
+                    "mimeType": "multipart/alternative",
+                    "parts": [
+                        {
+                            "mimeType": "text/plain",
+                            "body": {"data": _b64url("nested plain")},
+                        },
+                    ],
+                },
             ],
         }
         self.assertEqual(selectel_monitor._extract_body(payload), "nested plain")
@@ -127,18 +161,20 @@ class ForwardNewTests(unittest.TestCase):
         self._patch_state.start()
 
         self._orig_config = dict(selectel_monitor.CONFIG)
-        selectel_monitor.CONFIG.update({
-            "telegram_bot_token": "test_token",
-            "telegram_chat_id": "12345",
-            "sender_filter": "no-reply@selectel.ru",
-            "lookback": "2d",
-            "body_preview_len": 500,
-            "service_label": "Selectel",
-            "max_processed_ids": 200,
-            # Tests run without an image by default — flip per-test if needed.
-            "image_path": str(Path(self._tmp.name) / "no-such-image.png"),
-            "instance": "selectel",
-        })
+        selectel_monitor.CONFIG.update(
+            {
+                "telegram_bot_token": "test_token",
+                "telegram_chat_id": "12345",
+                "sender_filter": "no-reply@selectel.ru",
+                "lookback": "2d",
+                "body_preview_len": 500,
+                "service_label": "Selectel",
+                "max_processed_ids": 200,
+                # Tests run without an image by default — flip per-test if needed.
+                "image_path": str(Path(self._tmp.name) / "no-such-image.png"),
+                "instance": "selectel",
+            }
+        )
 
     def tearDown(self):
         self._patch_state.stop()
@@ -160,18 +196,26 @@ class ForwardNewTests(unittest.TestCase):
         }
 
     def test_forwards_only_unseen(self):
-        gmail = _build_fake_gmail({
-            "id-A": self._make_msg("Subj A", "body A"),
-            "id-B": self._make_msg("Subj B", "body B"),
-        })
+        gmail = _build_fake_gmail(
+            {
+                "id-A": self._make_msg("Subj A", "body A"),
+                "id-B": self._make_msg("Subj B", "body B"),
+            }
+        )
         # Pre-populate state with id-A → only id-B should be forwarded.
-        self._tmp_path.write_text(json.dumps({
-            "selectel": {"processed_message_ids": ["id-A"]}
-        }))
+        self._tmp_path.write_text(
+            json.dumps({"selectel": {"processed_message_ids": ["id-A"]}})
+        )
 
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=True) as send:
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(
+                selectel_monitor, "send_telegram_alert", return_value=True
+            ) as send,
+        ):
             selectel_monitor.forward_new()
 
         send.assert_called_once()
@@ -186,29 +230,43 @@ class ForwardNewTests(unittest.TestCase):
         )
 
     def test_no_new_messages_no_send(self):
-        gmail = _build_fake_gmail({
-            "id-A": self._make_msg("Subj A", "body A"),
-        })
-        self._tmp_path.write_text(json.dumps({
-            "selectel": {"processed_message_ids": ["id-A"]}
-        }))
+        gmail = _build_fake_gmail(
+            {
+                "id-A": self._make_msg("Subj A", "body A"),
+            }
+        )
+        self._tmp_path.write_text(
+            json.dumps({"selectel": {"processed_message_ids": ["id-A"]}})
+        )
 
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=True) as send:
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(
+                selectel_monitor, "send_telegram_alert", return_value=True
+            ) as send,
+        ):
             selectel_monitor.forward_new()
 
         send.assert_not_called()
 
     def test_telegram_fail_exits_without_state_save(self):
-        gmail = _build_fake_gmail({
-            "id-X": self._make_msg("Subj X", "body X"),
-        })
+        gmail = _build_fake_gmail(
+            {
+                "id-X": self._make_msg("Subj X", "body X"),
+            }
+        )
         # No prior state.
 
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=False):
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(selectel_monitor, "send_telegram_alert", return_value=False),
+        ):
             with self.assertRaises(SystemExit) as cm:
                 selectel_monitor.forward_new()
             self.assertEqual(cm.exception.code, 1)
@@ -227,14 +285,24 @@ class ForwardNewTests(unittest.TestCase):
         img_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"fake-image-data")
         selectel_monitor.CONFIG["image_path"] = str(img_path)
 
-        gmail = _build_fake_gmail({
-            "id-Z": self._make_msg("Subj Z", "body Z"),
-        })
+        gmail = _build_fake_gmail(
+            {
+                "id-Z": self._make_msg("Subj Z", "body Z"),
+            }
+        )
 
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_photo", return_value=True) as photo, \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=True) as text:
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(
+                selectel_monitor, "send_telegram_photo", return_value=True
+            ) as photo,
+            patch.object(
+                selectel_monitor, "send_telegram_alert", return_value=True
+            ) as text,
+        ):
             selectel_monitor.forward_new()
 
         photo.assert_called_once()
@@ -250,14 +318,24 @@ class ForwardNewTests(unittest.TestCase):
         img_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
         selectel_monitor.CONFIG["image_path"] = str(img_path)
 
-        gmail = _build_fake_gmail({
-            "id-Y": self._make_msg("Subj Y", "body Y"),
-        })
+        gmail = _build_fake_gmail(
+            {
+                "id-Y": self._make_msg("Subj Y", "body Y"),
+            }
+        )
 
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_photo", return_value=False) as photo, \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=True) as text:
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(
+                selectel_monitor, "send_telegram_photo", return_value=False
+            ) as photo,
+            patch.object(
+                selectel_monitor, "send_telegram_alert", return_value=True
+            ) as text,
+        ):
             selectel_monitor.forward_new()
 
         photo.assert_called_once()
@@ -266,27 +344,41 @@ class ForwardNewTests(unittest.TestCase):
     def test_instance_isolates_state_bucket(self):
         """Two instances (selectel, vdska) should not share processed_ids."""
         # Pre-populate state with vdska bucket → selectel run shouldn't see those.
-        self._tmp_path.write_text(json.dumps({
-            "vdska": {"processed_message_ids": ["id-A", "id-B"]},
-        }))
-        gmail = _build_fake_gmail({
-            "id-A": self._make_msg("Subj A", "body A"),
-        })
+        self._tmp_path.write_text(
+            json.dumps(
+                {
+                    "vdska": {"processed_message_ids": ["id-A", "id-B"]},
+                }
+            )
+        )
+        gmail = _build_fake_gmail(
+            {
+                "id-A": self._make_msg("Subj A", "body A"),
+            }
+        )
 
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=True) as send:
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(
+                selectel_monitor, "send_telegram_alert", return_value=True
+            ) as send,
+        ):
             selectel_monitor.forward_new()
 
         # selectel saw it as new because its bucket was empty.
         send.assert_called_once()
         state = json.loads(self._tmp_path.read_text())
         self.assertEqual(
-            state["selectel"]["processed_message_ids"], ["id-A"],
+            state["selectel"]["processed_message_ids"],
+            ["id-A"],
         )
         # vdska bucket untouched.
         self.assertEqual(
-            state["vdska"]["processed_message_ids"], ["id-A", "id-B"],
+            state["vdska"]["processed_message_ids"],
+            ["id-A", "id-B"],
         )
 
     def test_processed_ids_fifo_trimmed(self):
@@ -297,9 +389,13 @@ class ForwardNewTests(unittest.TestCase):
         msgs = {f"id-{i}": self._make_msg(f"S{i}", f"b{i}") for i in range(5)}
         gmail = _build_fake_gmail(msgs)
 
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=True):
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(selectel_monitor, "send_telegram_alert", return_value=True),
+        ):
             selectel_monitor.forward_new()
 
         state = json.loads(self._tmp_path.read_text())
@@ -334,14 +430,16 @@ class SendStatusTests(unittest.TestCase):
         self._patch_state.start()
 
         self._orig_config = dict(selectel_monitor.CONFIG)
-        selectel_monitor.CONFIG.update({
-            "telegram_bot_token": "test_token",
-            "telegram_chat_id": "12345",
-            "sender_filter": "no-reply@selectel.ru",
-            "lookback": "2d",
-            "service_label": "Selectel",
-            "instance": "selectel",
-        })
+        selectel_monitor.CONFIG.update(
+            {
+                "telegram_bot_token": "test_token",
+                "telegram_chat_id": "12345",
+                "sender_filter": "no-reply@selectel.ru",
+                "lookback": "2d",
+                "service_label": "Selectel",
+                "instance": "selectel",
+            }
+        )
 
     def tearDown(self):
         self._patch_state.stop()
@@ -350,18 +448,30 @@ class SendStatusTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_reports_counts_and_uses_instance_bucket(self):
-        gmail = _build_fake_gmail({
-            "id-1": {"payload": {"headers": [], "mimeType": "text/plain", "body": {}}},
-            "id-2": {"payload": {"headers": [], "mimeType": "text/plain", "body": {}}},
-        })
+        gmail = _build_fake_gmail(
+            {
+                "id-1": {
+                    "payload": {"headers": [], "mimeType": "text/plain", "body": {}}
+                },
+                "id-2": {
+                    "payload": {"headers": [], "mimeType": "text/plain", "body": {}}
+                },
+            }
+        )
         # Mark id-1 as already processed → new_count=1.
-        self._tmp_path.write_text(json.dumps({
-            "selectel": {"processed_message_ids": ["id-1"]}
-        }))
+        self._tmp_path.write_text(
+            json.dumps({"selectel": {"processed_message_ids": ["id-1"]}})
+        )
 
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=True) as send:
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(
+                selectel_monitor, "send_telegram_alert", return_value=True
+            ) as send,
+        ):
             selectel_monitor.send_status()
 
         send.assert_called_once()
@@ -371,9 +481,13 @@ class SendStatusTests(unittest.TestCase):
 
     def test_telegram_fail_exits(self):
         gmail = _build_fake_gmail({})
-        with patch.object(selectel_monitor, "_load_credentials", return_value=MagicMock()), \
-             patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail), \
-             patch.object(selectel_monitor, "send_telegram_alert", return_value=False):
+        with (
+            patch.object(
+                selectel_monitor, "_load_credentials", return_value=MagicMock()
+            ),
+            patch.object(selectel_monitor, "_build_gmail_service", return_value=gmail),
+            patch.object(selectel_monitor, "send_telegram_alert", return_value=False),
+        ):
             with self.assertRaises(SystemExit) as cm:
                 selectel_monitor.send_status()
             self.assertEqual(cm.exception.code, 1)
@@ -391,20 +505,26 @@ class MainDispatchTests(unittest.TestCase):
         selectel_monitor.CONFIG.update(self._orig_config)
 
     def test_default_calls_forward_new_then_heartbeat(self):
-        with patch.object(selectel_monitor, "forward_new") as fn, \
-             patch.object(selectel_monitor, "send_status") as ss, \
-             patch.object(selectel_monitor, "touch_heartbeat") as hb, \
-             patch.object(selectel_monitor.sys, "argv", ["selectel_monitor.py"]):
+        with (
+            patch.object(selectel_monitor, "forward_new") as fn,
+            patch.object(selectel_monitor, "send_status") as ss,
+            patch.object(selectel_monitor, "touch_heartbeat") as hb,
+            patch.object(selectel_monitor.sys, "argv", ["selectel_monitor.py"]),
+        ):
             selectel_monitor.main()
         fn.assert_called_once()
         ss.assert_not_called()
         hb.assert_called_once_with("vdska-monitor-check")
 
     def test_status_flag_calls_send_status(self):
-        with patch.object(selectel_monitor, "forward_new") as fn, \
-             patch.object(selectel_monitor, "send_status") as ss, \
-             patch.object(selectel_monitor, "touch_heartbeat") as hb, \
-             patch.object(selectel_monitor.sys, "argv", ["selectel_monitor.py", "--status"]):
+        with (
+            patch.object(selectel_monitor, "forward_new") as fn,
+            patch.object(selectel_monitor, "send_status") as ss,
+            patch.object(selectel_monitor, "touch_heartbeat") as hb,
+            patch.object(
+                selectel_monitor.sys, "argv", ["selectel_monitor.py", "--status"]
+            ),
+        ):
             selectel_monitor.main()
         ss.assert_called_once()
         fn.assert_not_called()
@@ -412,9 +532,11 @@ class MainDispatchTests(unittest.TestCase):
 
     def test_heartbeat_skipped_on_systemexit(self):
         """If forward_new raises SystemExit (Telegram fail), heartbeat is NOT written."""
-        with patch.object(selectel_monitor, "forward_new", side_effect=SystemExit(1)), \
-             patch.object(selectel_monitor, "touch_heartbeat") as hb, \
-             patch.object(selectel_monitor.sys, "argv", ["selectel_monitor.py"]):
+        with (
+            patch.object(selectel_monitor, "forward_new", side_effect=SystemExit(1)),
+            patch.object(selectel_monitor, "touch_heartbeat") as hb,
+            patch.object(selectel_monitor.sys, "argv", ["selectel_monitor.py"]),
+        ):
             with self.assertRaises(SystemExit):
                 selectel_monitor.main()
         hb.assert_not_called()
