@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,48 @@ from utils import (
     send_telegram_photo,
     touch_heartbeat,
 )
+
+
+class SberAPIUnavailable(Exception):
+    """Поднимается, если Sber API не ответил после всех retry (сетевой уровень).
+
+    HTTP-ответ 4xx/5xx сюда НЕ попадает — только таймауты, ConnectionError, SSLError,
+    т.е. случаи, когда соединение не установилось или не завершилось.
+    """
+
+
+SBER_REQUEST_MAX_RETRIES = 3
+SBER_OUTAGE_ALERT_THRESHOLD_HOURS = 6
+
+
+def _sber_request(method, url, *, max_retries=SBER_REQUEST_MAX_RETRIES, **kwargs):
+    """Единая точка HTTP-вызовов Sber API с retry + exponential backoff.
+
+    При `requests.RequestException` (ConnectTimeout, ReadTimeout, ConnectionError,
+    SSLError, …) — повтор до `max_retries` раз с паузами 1с, 2с. HTTP-коды не
+    интерпретируются: возвращается Response как есть, вызывающий сам решает,
+    что делать с 4xx/5xx.
+
+    Raises:
+        SberAPIUnavailable: когда все попытки исчерпаны.
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return requests.request(method, url, **kwargs)
+        except requests.RequestException as e:
+            last_err = e
+            log.warning(
+                "Sber API %s %s (attempt %d/%d): %s",
+                method,
+                url,
+                attempt + 1,
+                max_retries,
+                e,
+            )
+            if attempt < max_retries - 1:
+                time.sleep(2**attempt)
+    raise SberAPIUnavailable(str(last_err))
 
 
 def _parse_labels(raw):
@@ -53,6 +95,7 @@ def _normalize_account_number(number):
     if not number:
         return ""
     return str(number).replace(" ", "").replace("-", "")
+
 
 log = logging.getLogger("sber-monitor")
 
@@ -118,12 +161,14 @@ def load_tokens():
             f"{TOKENS_FILE} не найден. Запусти `python3 sber_auth.py` сначала."
         )
     import json
+
     with open(TOKENS_FILE) as f:
         return json.load(f)
 
 
 def save_tokens(tokens):
     import json
+
     with open(TOKENS_FILE, "w") as f:
         json.dump(tokens, f, indent=2, ensure_ascii=False)
 
@@ -145,8 +190,14 @@ def refresh_access_token(tokens):
     }
     data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
 
-    resp = requests.post(
-        url, headers=headers, data=data, timeout=30, cert=_client_cert_tuple(), verify=_verify_bundle()
+    resp = _sber_request(
+        "POST",
+        url,
+        headers=headers,
+        data=data,
+        timeout=30,
+        cert=_client_cert_tuple(),
+        verify=_verify_bundle(),
     )
     if resp.status_code != 200:
         raise SystemExit(
@@ -160,9 +211,9 @@ def refresh_access_token(tokens):
         "id_token": payload.get("id_token", tokens.get("id_token")),
         "expires_at": now + int(payload.get("expires_in", 3600)),
         "issued_at": now,
-        "refresh_issued_at": now if "refresh_token" in payload else tokens.get(
-            "refresh_issued_at", now
-        ),
+        "refresh_issued_at": now
+        if "refresh_token" in payload
+        else tokens.get("refresh_issued_at", now),
         "scope": payload.get("scope", tokens.get("scope")),
     }
     save_tokens(new_tokens)
@@ -210,8 +261,14 @@ def get_client_accounts(access_token):
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
-    resp = requests.get(url, headers=headers, timeout=30,
-                        cert=_client_cert_tuple(), verify=_verify_bundle())
+    resp = _sber_request(
+        "GET",
+        url,
+        headers=headers,
+        timeout=30,
+        cert=_client_cert_tuple(),
+        verify=_verify_bundle(),
+    )
     if resp.status_code != 200:
         raise RuntimeError(
             f"client-info failed: HTTP {resp.status_code}\n{resp.text[:500]}"
@@ -231,11 +288,22 @@ def get_account_balance(access_token, account_number, statement_date):
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
-    resp = requests.get(url, headers=headers, params=params, timeout=30,
-                        cert=_client_cert_tuple(), verify=_verify_bundle())
+    resp = _sber_request(
+        "GET",
+        url,
+        headers=headers,
+        params=params,
+        timeout=30,
+        cert=_client_cert_tuple(),
+        verify=_verify_bundle(),
+    )
     if resp.status_code != 200:
-        log.warning("statement/summary %s %s: HTTP %d",
-                    account_number, statement_date, resp.status_code)
+        log.warning(
+            "statement/summary %s %s: HTTP %d",
+            account_number,
+            statement_date,
+            resp.status_code,
+        )
         return None
     data = resp.json()
     try:
@@ -314,6 +382,83 @@ def save_sber_state(sber_state):
     save_state(state)
 
 
+def _mark_sber_api_reached(sber_state, now=None):
+    """Фиксирует факт успешного ответа Sber API в sber_state (без save).
+
+    Обновляет `last_successful_api_at` и чистит `last_api_down_alert_date`,
+    чтобы следующий длительный outage снова мог выстрелить алертом.
+    Вызывается перед save_sber_state в каждой success-ветке.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    sber_state["last_successful_api_at"] = now.isoformat()
+    sber_state.pop("last_api_down_alert_date", None)
+
+
+def _handle_sber_outage(err):
+    """Soft-fail после SberAPIUnavailable.
+
+    - Пишет `last_api_failure_at` в state.
+    - Считает gap = now − `last_successful_api_at`. Если ≥ 6ч и сегодня ещё
+      не было outage-алерта — шлёт одно сообщение в Telegram и отмечает
+      `last_api_down_alert_date = today`. Если Telegram упал — sys.exit(1)
+      (Phase 1 инвариант сохраняется).
+    - Иначе — молчит; heartbeat всё равно обновится в main(), watchdog не шумит.
+    """
+    now = datetime.now(timezone.utc)
+    sber_state = get_sber_state()
+    sber_state["last_api_failure_at"] = now.isoformat()
+
+    last_success_iso = sber_state.get("last_successful_api_at")
+    gap_hours = None
+    last_success_human = "не зафиксирован"
+    if last_success_iso:
+        try:
+            last_success = datetime.fromisoformat(last_success_iso)
+            if last_success.tzinfo is None:
+                last_success = last_success.replace(tzinfo=timezone.utc)
+            gap_hours = (now - last_success).total_seconds() / 3600
+            last_success_human = last_success.astimezone(
+                ZoneInfo(CONFIG["alert_timezone"])
+            ).strftime("%d.%m.%Y %H:%M %Z")
+        except (ValueError, TypeError) as e:
+            log.warning(
+                "Can't parse last_successful_api_at=%r: %s", last_success_iso, e
+            )
+
+    log.warning(
+        "Sber API outage caught softly (gap=%s h): %s",
+        f"{gap_hours:.1f}" if gap_hours is not None else "?",
+        err,
+    )
+
+    today_str = now.astimezone(ZoneInfo(CONFIG["alert_timezone"])).strftime("%Y-%m-%d")
+
+    should_alert = (
+        gap_hours is not None
+        and gap_hours >= SBER_OUTAGE_ALERT_THRESHOLD_HOURS
+        and sber_state.get("last_api_down_alert_date") != today_str
+    )
+    if should_alert:
+        gap_hours_int = int(gap_hours)
+        message = (
+            "⚠️ <b>Sber API недоступен</b>\n\n"
+            f"Нет связи уже <b>{gap_hours_int} ч</b>.\n"
+            f"Последний успешный ответ: {last_success_human}\n\n"
+            f"Ошибка: <code>{str(err)[:300]}</code>\n\n"
+            "Проверка балансов пока приостановлена. Если это затянулось — "
+            "загляни в логи <code>sber-monitor-check.service</code>."
+        )
+        if _alert(message):
+            sber_state["last_api_down_alert_date"] = today_str
+            save_sber_state(sber_state)
+        else:
+            save_sber_state(sber_state)
+            sys.exit(1)
+    else:
+        save_sber_state(sber_state)
+
+
 STALE_BALANCE_DAYS = 7  # alert when balance hasn't moved for this many days
 
 
@@ -335,6 +480,7 @@ def update_balance_change_history(accounts, sber_state, now_ts=None):
     Returns the updated history dict (also mutates sber_state in-place).
     """
     import time as _t
+
     if now_ts is None:
         now_ts = int(_t.time())
     hist = sber_state.setdefault("balance_changes", {})
@@ -357,6 +503,7 @@ def format_stale_note(account_number, sber_state, now_ts=None):
     fresh to comment on.
     """
     import time as _t
+
     if now_ts is None:
         now_ts = int(_t.time())
     hist = sber_state.get("balance_changes", {})
@@ -431,7 +578,8 @@ def check_and_alert(force_refresh=False):
     # client_secret проверяется отдельно в refresh_access_token — без него скрипт
     # работает пока access_token не истёк.
     missing = [
-        k for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
+        k
+        for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
         if not CONFIG[k]
     ]
     if missing:
@@ -446,14 +594,18 @@ def check_and_alert(force_refresh=False):
         print(f"Weekend ({now.strftime('%A')}) — skip check_and_alert entirely")
         return
 
-    access_token, tokens = get_valid_access_token(force_refresh=force_refresh)
-    check_refresh_token_expiry(tokens)
+    try:
+        access_token, tokens = get_valid_access_token(force_refresh=force_refresh)
+        check_refresh_token_expiry(tokens)
 
-    raw_accounts = get_client_accounts(access_token)
-    accounts = filter_rub_current_accounts(raw_accounts)
+        raw_accounts = get_client_accounts(access_token)
+        accounts = filter_rub_current_accounts(raw_accounts)
 
-    statement_date = now.strftime("%Y-%m-%d")
-    accounts = enrich_with_balances(access_token, accounts, statement_date)
+        statement_date = now.strftime("%Y-%m-%d")
+        accounts = enrich_with_balances(access_token, accounts, statement_date)
+    except SberAPIUnavailable as e:
+        _handle_sber_outage(e)
+        return
 
     threshold = CONFIG["balance_threshold"]
     above = [a for a in accounts if a.get("balance", 0) > threshold]
@@ -464,6 +616,7 @@ def check_and_alert(force_refresh=False):
     last_alert_hour = sber_state.get("last_alert_hour")
     now_ts = int(now.timestamp())
     update_balance_change_history(accounts, sber_state, now_ts=now_ts)
+    _mark_sber_api_reached(sber_state)
 
     threshold_str = f"{threshold:,.0f}".replace(",", " ")
     print(f"RUB current accounts: {len(accounts)}, above threshold: {len(above)}")
@@ -480,14 +633,15 @@ def check_and_alert(force_refresh=False):
             f"{CONFIG['alert_hour_end']:02d}:59), skip"
         )
     elif last_alert_hour == current_hour_key:
-        print(f"Already alerted this hour ({current_hour_key}), skip to avoid duplicate")
+        print(
+            f"Already alerted this hour ({current_hour_key}), skip to avoid duplicate"
+        )
     else:
         above_lines = []
         for a in above:
             label = account_label(a.get("accountNumber"))
             balance_str = f"{a['balance']:,.2f}".replace(",", " ")
-            stale = format_stale_note(a.get("accountNumber"), sber_state,
-                                       now_ts=now_ts)
+            stale = format_stale_note(a.get("accountNumber"), sber_state, now_ts=now_ts)
             above_lines.append(f"  {label}: <b>{balance_str} ₽</b>{stale}")
         message = (
             f"🚨 <b>СберБизнес — положи деньги на депозит</b>\n\n"
@@ -558,7 +712,8 @@ def send_final_warning():
     to a deposit anyway). Silent if balances are already fine.
     """
     missing = [
-        k for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
+        k
+        for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
         if not CONFIG[k]
     ]
     if missing:
@@ -578,12 +733,16 @@ def send_final_warning():
         print(f"Final warning already sent today ({today_str}), skip")
         return
 
-    access_token, tokens = get_valid_access_token()
-    check_refresh_token_expiry(tokens)
-    raw_accounts = get_client_accounts(access_token)
-    accounts = filter_rub_current_accounts(raw_accounts)
-    statement_date = today_str
-    accounts = enrich_with_balances(access_token, accounts, statement_date)
+    try:
+        access_token, tokens = get_valid_access_token()
+        check_refresh_token_expiry(tokens)
+        raw_accounts = get_client_accounts(access_token)
+        accounts = filter_rub_current_accounts(raw_accounts)
+        statement_date = today_str
+        accounts = enrich_with_balances(access_token, accounts, statement_date)
+    except SberAPIUnavailable as e:
+        _handle_sber_outage(e)
+        return
 
     threshold = CONFIG["balance_threshold"]
     above = [a for a in accounts if a.get("balance", 0) > threshold]
@@ -591,6 +750,7 @@ def send_final_warning():
     # Refresh stale-balance history every time we fetch, including here
     now_ts = int(now.timestamp())
     update_balance_change_history(accounts, sber_state, now_ts=now_ts)
+    _mark_sber_api_reached(sber_state)
 
     if not above:
         # Persist the refreshed balance_changes even if we skip the alert
@@ -603,8 +763,7 @@ def send_final_warning():
     for a in above:
         label = account_label(a.get("accountNumber"))
         balance_str = f"{a['balance']:,.2f}".replace(",", " ")
-        stale = format_stale_note(a.get("accountNumber"), sber_state,
-                                   now_ts=now_ts)
+        stale = format_stale_note(a.get("accountNumber"), sber_state, now_ts=now_ts)
         above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>{stale}")
 
     hours_left = max(0, CONFIG["alert_hour_end"] + 1 - now.hour)
@@ -627,9 +786,11 @@ def send_final_warning():
 
     # Telegram caption limit is 1024 chars — keep it lean, only essentials.
     caption = (
-        header + "\n"
+        header
+        + "\n"
         + f"<b>Выше порога {threshold_str} ₽:</b>\n"
-        + "\n".join(above_lines) + "\n\n"
+        + "\n".join(above_lines)
+        + "\n\n"
         + footer
     )
 
@@ -670,7 +831,8 @@ def send_friday_morning_reminder():
     - Silent if nothing is above threshold.
     """
     missing = [
-        k for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
+        k
+        for k in ("client_id", "telegram_bot_token", "telegram_chat_id")
         if not CONFIG[k]
     ]
     if missing:
@@ -688,17 +850,22 @@ def send_friday_morning_reminder():
         print(f"Friday reminder already sent today ({today_str}), skip")
         return
 
-    access_token, tokens = get_valid_access_token()
-    check_refresh_token_expiry(tokens)
-    raw_accounts = get_client_accounts(access_token)
-    accounts = filter_rub_current_accounts(raw_accounts)
-    accounts = enrich_with_balances(access_token, accounts, today_str)
+    try:
+        access_token, tokens = get_valid_access_token()
+        check_refresh_token_expiry(tokens)
+        raw_accounts = get_client_accounts(access_token)
+        accounts = filter_rub_current_accounts(raw_accounts)
+        accounts = enrich_with_balances(access_token, accounts, today_str)
+    except SberAPIUnavailable as e:
+        _handle_sber_outage(e)
+        return
 
     threshold = CONFIG["balance_threshold"]
     above = [a for a in accounts if a.get("balance", 0) > threshold]
 
     now_ts = int(now.timestamp())
     update_balance_change_history(accounts, sber_state, now_ts=now_ts)
+    _mark_sber_api_reached(sber_state)
 
     if not above:
         save_sber_state(sber_state)
@@ -710,8 +877,7 @@ def send_friday_morning_reminder():
     for a in above:
         label = account_label(a.get("accountNumber"))
         balance_str = f"{a['balance']:,.2f}".replace(",", " ")
-        stale = format_stale_note(a.get("accountNumber"), sber_state,
-                                   now_ts=now_ts)
+        stale = format_stale_note(a.get("accountNumber"), sber_state, now_ts=now_ts)
         above_lines.append(f"  • {label}: <b>{balance_str} ₽</b>{stale}")
 
     message = (
@@ -736,15 +902,21 @@ def send_friday_morning_reminder():
 
 
 def send_status():
-    access_token, tokens = get_valid_access_token()
-    check_refresh_token_expiry(tokens)
-    raw_accounts = get_client_accounts(access_token)
-    accounts = filter_rub_current_accounts(raw_accounts)
-    statement_date = now_in_alert_tz().strftime("%Y-%m-%d")
-    accounts = enrich_with_balances(access_token, accounts, statement_date)
+    try:
+        access_token, tokens = get_valid_access_token()
+        check_refresh_token_expiry(tokens)
+        raw_accounts = get_client_accounts(access_token)
+        accounts = filter_rub_current_accounts(raw_accounts)
+        statement_date = now_in_alert_tz().strftime("%Y-%m-%d")
+        accounts = enrich_with_balances(access_token, accounts, statement_date)
+    except SberAPIUnavailable as e:
+        _handle_sber_outage(e)
+        return
     threshold = CONFIG["balance_threshold"]
     above = [a for a in accounts if a.get("balance", 0) > threshold]
     sber_state = get_sber_state()
+    _mark_sber_api_reached(sber_state)
+    save_sber_state(sber_state)
     message = build_status_message(accounts, above, sber_state)
     if _alert(message):
         print("Status sent")
@@ -754,7 +926,9 @@ def send_status():
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
 
     args = sys.argv[1:]
     # heartbeat is reached only when the subcommand completes without
