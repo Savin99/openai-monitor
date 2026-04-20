@@ -41,7 +41,7 @@ def get_costs_for_period(start_ts, end_ts=None, max_retries=3):
     url = "https://api.openai.com/v1/organization/costs"
     headers = {
         "Authorization": f"Bearer {CONFIG['openai_admin_key']}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     total = 0.0
@@ -61,7 +61,9 @@ def get_costs_for_period(start_ts, end_ts=None, max_retries=3):
                 response = requests.get(url, headers=headers, params=params, timeout=30)
                 if response.status_code != 200:
                     last_err = f"HTTP {response.status_code}: {response.text[:200]}"
-                    log.error("OpenAI costs API (attempt %d): %s", attempt + 1, last_err)
+                    log.error(
+                        "OpenAI costs API (attempt %d): %s", attempt + 1, last_err
+                    )
                 else:
                     data = response.json()
                     break
@@ -74,7 +76,7 @@ def get_costs_for_period(start_ts, end_ts=None, max_retries=3):
                 return None, last_err
 
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
 
         if data is None:
             return None, last_err
@@ -133,9 +135,62 @@ def get_total_costs():
     return get_costs_for_period(start_time)
 
 
+def _get_total_spent_with_cache():
+    """Fetch 2026 total spent, с fallback на закэшированное значение.
+
+    Вызывает `get_total_costs()`. При успехе — кладёт значение и временную метку
+    в state (`last_total_spent`, `last_total_spent_at`) и возвращает свежее число.
+    При ошибке (HTTP 5xx, сеть) — возвращает последнее закэшированное число,
+    чтобы статус-отчёт не показывал фиктивный «остаток = всего внесено».
+
+    Returns (total_spent, stale_age_min, err):
+    - total_spent: float в долларах или None (если API упал и кэша нет).
+    - stale_age_min: None если значение свежее; int (минуты) если из кэша;
+      -1 если возраст не удалось распарсить.
+    - err: строка ошибки API или None.
+    """
+    total, err = get_total_costs()
+    state = load_state()
+    now = datetime.now(timezone.utc)
+
+    if total is not None:
+        state["last_total_spent"] = total
+        state["last_total_spent_at"] = now.isoformat()
+        save_state(state)
+        return total, None, None
+
+    cached = state.get("last_total_spent")
+    cached_at = state.get("last_total_spent_at")
+    if cached is None or not cached_at:
+        return None, None, err
+
+    try:
+        then = datetime.fromisoformat(cached_at)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        age_min = max(0, int((now - then).total_seconds() / 60))
+    except (ValueError, TypeError):
+        age_min = -1
+
+    return float(cached), age_min, err
+
+
+def _format_manual_source(stale_age_min):
+    """Маркер источника баланса для UI. None — свежие данные, int — кэш."""
+    if stale_age_min is None:
+        return "ручной"
+    if stale_age_min < 0:
+        return "ручной, кэш"
+    if stale_age_min < 60:
+        return f"ручной, кэш {stale_age_min}м"
+    return f"ручной, кэш {stale_age_min // 60}ч"
+
+
 def get_today_costs():
     """Get today's costs. Returns cost float or None."""
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     start_time = int(today.timestamp())
     cost, _err = get_costs_for_period(start_time)
     return cost
@@ -171,12 +226,10 @@ def get_last_weeks_costs(num_weeks=4):
         # Calculate week end (Sunday)
         week_end = week_start + timedelta(days=7)
 
-        cost, _err = get_costs_for_period(int(week_start.timestamp()), int(week_end.timestamp()))
-        weeks.append({
-            "start": week_start,
-            "end": week_end,
-            "cost": cost or 0
-        })
+        cost, _err = get_costs_for_period(
+            int(week_start.timestamp()), int(week_end.timestamp())
+        )
+        weeks.append({"start": week_start, "end": week_end, "cost": cost or 0})
 
     return weeks
 
@@ -216,8 +269,10 @@ def get_daily_costs(num_days=30):
         if ts is None:
             continue
         d = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-        total = sum(float(r.get("amount", {}).get("value", 0))
-                    for r in bucket.get("results", []))
+        total = sum(
+            float(r.get("amount", {}).get("value", 0))
+            for r in bucket.get("results", [])
+        )
         per_day[d] = per_day.get(d, 0) + total
 
     result = []
@@ -337,11 +392,10 @@ def get_last_months_costs(num_months=3):
         else:
             next_month = datetime(year, month + 1, 1, tzinfo=timezone.utc)
 
-        cost, _err = get_costs_for_period(int(first_day.timestamp()), int(next_month.timestamp()))
-        months.append({
-            "month": first_day,
-            "cost": cost or 0
-        })
+        cost, _err = get_costs_for_period(
+            int(first_day.timestamp()), int(next_month.timestamp())
+        )
+        months.append({"month": first_day, "cost": cost or 0})
 
     return months
 
@@ -387,6 +441,10 @@ def load_state():
         "total_deposited": DEFAULT_TOTAL_DEPOSITED,
         "bot_offset": None,
         "topup_history": [],
+        # Последний успешно прочитанный total_spent за 2026 — используется как
+        # fallback в статусе, если OpenAI Costs API временно недоступен (HTTP 5xx).
+        "last_total_spent": None,
+        "last_total_spent_at": None,  # ISO-8601 UTC
     }
     return {**defaults, **state}
 
@@ -408,7 +466,7 @@ def topup(amount):
 
 def get_status_message():
     """Build status message with current balance info."""
-    total_spent, costs_err = get_total_costs()
+    total_spent, stale_age, costs_err = _get_total_spent_with_cache()
     state = load_state()
     threshold = state.get("alert_threshold", CONFIG["alert_threshold"])
 
@@ -426,15 +484,17 @@ def get_status_message():
         source = "авто"
     else:
         total_deposited = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
-        remaining = round(total_deposited - (total_spent or 0), 2)
-        source = "ручной"
+        remaining = round(total_deposited - total_spent, 2)
+        source = _format_manual_source(stale_age)
 
     today_spent = get_today_costs()
 
     lines = [f"<b>OpenAI API — Статус</b>\n"]
     lines.append(f"Остаток: <b>${remaining}</b> ({source})")
-    lines.append(f"Потрачено сегодня: ${today_spent or '?'}")
-    lines.append(f"Потрачено за 2026: ${total_spent or '?'}")
+    lines.append(
+        f"Потрачено сегодня: ${today_spent if today_spent is not None else '?'}"
+    )
+    lines.append(f"Потрачено за 2026: ${total_spent}")
     lines.append(f"Всего внесено: ${total_deposited}")
     lines.append(f"Порог алерта: ${threshold}")
 
@@ -467,9 +527,18 @@ def get_month_report():
     months = get_last_months_costs(3)
 
     month_names = {
-        1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-        5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-        9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+        1: "Январь",
+        2: "Февраль",
+        3: "Март",
+        4: "Апрель",
+        5: "Май",
+        6: "Июнь",
+        7: "Июль",
+        8: "Август",
+        9: "Сентябрь",
+        10: "Октябрь",
+        11: "Ноябрь",
+        12: "Декабрь",
     }
 
     lines = ["<b>📊 Отчёт по месяцам</b>\n"]
@@ -503,9 +572,9 @@ def get_topup_history():
         actual_datetime = entry.get("actual_datetime", "")
 
         if actual_datetime:
-            lines.append(f"{i+1}. <b>+${amount}</b> — {actual_datetime}")
+            lines.append(f"{i + 1}. <b>+${amount}</b> — {actual_datetime}")
         else:
-            lines.append(f"{i+1}. <b>+${amount}</b> — {date_str}")
+            lines.append(f"{i + 1}. <b>+${amount}</b> — {date_str}")
 
     total = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
     lines.append(f"\nВсего внесено: <b>${total}</b>")
@@ -588,7 +657,10 @@ def do_delete_topup(chat_id, index):
     state["total_deposited"] = round(state.get("total_deposited", 0) - amount, 2)
     save_state(state)
 
-    reply(chat_id, f"🗑 Удалено пополнение <b>${amount}</b>\nВсего внесено: ${state['total_deposited']}")
+    reply(
+        chat_id,
+        f"🗑 Удалено пополнение <b>${amount}</b>\nВсего внесено: ${state['total_deposited']}",
+    )
 
 
 def send_topup_menu(chat_id):
@@ -633,7 +705,10 @@ def send_settings_menu(chat_id):
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": f"🔔 Порог алерта (${current})", "callback_data": "settings:threshold"},
+                {
+                    "text": f"🔔 Порог алерта (${current})",
+                    "callback_data": "settings:threshold",
+                },
             ],
         ]
     }
@@ -656,7 +731,10 @@ def handle_callback(callback_query):
             state = load_state()
             state["awaiting"] = "topup_amount"
             save_state(state)
-            reply(chat_id, "Введи сумму пополнения:\n\n<i>Можно с датой/временем: 500 01.02.2026 14:30</i>")
+            reply(
+                chat_id,
+                "Введи сумму пополнения:\n\n<i>Можно с датой/временем: 500 01.02.2026 14:30</i>",
+            )
         elif value == "history":
             answer_callback(cq_id)
             reply(chat_id, get_topup_history())
@@ -672,10 +750,19 @@ def handle_callback(callback_query):
             keyboard = {
                 "inline_keyboard": [
                     [{"text": f"Сейчас ({now_str})", "callback_data": "topup_dt:now"}],
-                    [{"text": "Указать дату/время", "callback_data": "topup_dt:custom"}],
+                    [
+                        {
+                            "text": "Указать дату/время",
+                            "callback_data": "topup_dt:custom",
+                        }
+                    ],
                 ]
             }
-            reply(chat_id, f"Пополнение на <b>${amount}</b>\nКогда была оплата?", reply_markup=keyboard)
+            reply(
+                chat_id,
+                f"Пополнение на <b>${amount}</b>\nКогда была оплата?",
+                reply_markup=keyboard,
+            )
 
     elif data.startswith("topup_dt:"):
         value = data.split(":")[1]
@@ -693,7 +780,9 @@ def handle_callback(callback_query):
             answer_callback(cq_id)
             state["awaiting"] = "topup_datetime_input"
             save_state(state)
-            reply(chat_id, "Введи дату и время оплаты:\n<i>Например: 01.02.2026 14:30</i>")
+            reply(
+                chat_id, "Введи дату и время оплаты:\n<i>Например: 01.02.2026 14:30</i>"
+            )
 
     elif data.startswith("threshold:"):
         value = data.split(":")[1]
@@ -743,7 +832,11 @@ def send_threshold_menu(chat_id):
             ],
         ]
     }
-    reply(chat_id, f"Текущий порог: <b>${current}</b>\nВыбери новый:", reply_markup=keyboard)
+    reply(
+        chat_id,
+        f"Текущий порог: <b>${current}</b>\nВыбери новый:",
+        reply_markup=keyboard,
+    )
 
 
 def handle_bot_message(message):
@@ -838,20 +931,23 @@ def handle_bot_message(message):
             reply(chat_id, "Введи порог числом, например 200")
 
     elif text.startswith("/help") or text == "/start":
-        reply(chat_id, (
-            "<b>OpenAI Monitor</b>\n\n"
-            "Используй кнопки или команды:\n\n"
-            "/status — баланс\n"
-            "/topup — пополнить\n"
-            "/topup 500 — быстрое пополнение\n"
-            "/topup 500 01.02.2026 14:30 — с датой/временем\n"
-            "/history — история пополнений\n"
-            "/del 1 — удалить пополнение\n"
-            "/weeks — отчёт по неделям\n"
-            "/months — отчёт по месяцам\n"
-            "/threshold — порог алерта\n"
-            "/settings — настройки"
-        ))
+        reply(
+            chat_id,
+            (
+                "<b>OpenAI Monitor</b>\n\n"
+                "Используй кнопки или команды:\n\n"
+                "/status — баланс\n"
+                "/topup — пополнить\n"
+                "/topup 500 — быстрое пополнение\n"
+                "/topup 500 01.02.2026 14:30 — с датой/временем\n"
+                "/history — история пополнений\n"
+                "/del 1 — удалить пополнение\n"
+                "/weeks — отчёт по неделям\n"
+                "/months — отчёт по месяцам\n"
+                "/threshold — порог алерта\n"
+                "/settings — настройки"
+            ),
+        )
 
 
 def run_bot():
@@ -870,7 +966,9 @@ def run_bot():
 
     while True:
         try:
-            url = f"https://api.telegram.org/bot{CONFIG['telegram_bot_token']}/getUpdates"
+            url = (
+                f"https://api.telegram.org/bot{CONFIG['telegram_bot_token']}/getUpdates"
+            )
             params = {"timeout": 30}
             if offset:
                 params["offset"] = offset
@@ -897,8 +995,11 @@ def run_bot():
 
 def check_and_alert():
     """Cron mode: check balance and send alert if needed."""
-    missing = [k for k in ("openai_admin_key", "telegram_bot_token", "telegram_chat_id")
-               if not CONFIG[k]]
+    missing = [
+        k
+        for k in ("openai_admin_key", "telegram_bot_token", "telegram_chat_id")
+        if not CONFIG[k]
+    ]
     if missing:
         print(f"Missing environment variables: {', '.join(v.upper() for v in missing)}")
         return
@@ -984,17 +1085,36 @@ def send_status_report():
     Graceful fallback: if chart generation fails, still sends the text status
     as a regular message so the daily report never silently drops.
     """
-    missing = [k for k in ("openai_admin_key", "telegram_bot_token", "telegram_chat_id")
-               if not CONFIG[k]]
+    missing = [
+        k
+        for k in ("openai_admin_key", "telegram_bot_token", "telegram_chat_id")
+        if not CONFIG[k]
+    ]
     if missing:
         print(f"Missing environment variables: {', '.join(v.upper() for v in missing)}")
         return
 
     # 1) Gather numbers
-    total_spent, costs_err = get_total_costs()
+    total_spent, stale_age, costs_err = _get_total_spent_with_cache()
     state = load_state()
     threshold = state.get("alert_threshold", CONFIG["alert_threshold"])
     billing = get_billing_balance()
+
+    # Нет ни свежих данных от Costs API, ни закэшированных, ни billing —
+    # отправляем честную ошибку вместо фиктивного «остаток = всего внесено».
+    if total_spent is None and billing is None:
+        msg = (
+            "<b>OpenAI API — Ежедневный статус</b>\n\n"
+            "Не удалось получить данные от OpenAI Costs API и нет закэшированного "
+            "значения.\n\n"
+            f"<b>Ошибка:</b> <code>{costs_err}</code>"
+        )
+        if send_telegram_alert(msg):
+            print("Status report (error) sent!")
+        else:
+            print("Failed to send status report")
+            sys.exit(1)
+        return
 
     if billing:
         total_deposited = billing["total_granted"]
@@ -1002,8 +1122,8 @@ def send_status_report():
         source = "авто"
     else:
         total_deposited = state.get("total_deposited", DEFAULT_TOTAL_DEPOSITED)
-        remaining = round(total_deposited - (total_spent or 0), 2)
-        source = "ручной"
+        remaining = round(total_deposited - total_spent, 2)
+        source = _format_manual_source(stale_age)
 
     today_spent = get_today_costs()
     forecast = forecast_days_remaining(remaining) if remaining is not None else None
@@ -1011,8 +1131,12 @@ def send_status_report():
     # 2) Build text caption (HTML)
     lines = ["<b>OpenAI API — Ежедневный статус</b>", ""]
     lines.append(f"Остаток: <b>${remaining}</b> ({source})")
-    lines.append(f"Потрачено сегодня: ${today_spent if today_spent is not None else '?'}")
-    lines.append(f"Потрачено за 2026: ${total_spent if total_spent is not None else '?'}")
+    lines.append(
+        f"Потрачено сегодня: ${today_spent if today_spent is not None else '?'}"
+    )
+    lines.append(
+        f"Потрачено за 2026: ${total_spent if total_spent is not None else '?'}"
+    )
     lines.append(f"Всего внесено: ${total_deposited}")
     lines.append(f"Порог алерта: ${threshold}")
     if forecast is not None:
@@ -1030,6 +1154,7 @@ def send_status_report():
     # 3) Build chart (best-effort); fallback to text-only on any error
     try:
         import charts  # local import so non-chart paths don't require matplotlib
+
         daily = get_daily_costs(30)
         # topups only for the charted window
         if daily:
