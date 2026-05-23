@@ -116,6 +116,54 @@ def send_telegram_photo(photo_bytes, bot_token, chat_id,
     return False
 
 
+def send_telegram_media_group(images, bot_token, chat_id,
+                              caption=None, parse_mode="HTML",
+                              max_retries=3):
+    """Send 2-10 PNG images as one Telegram album via sendMediaGroup.
+
+    images: [(filename, png_bytes), ...]. Caption is attached to the first item.
+    """
+    if not bot_token or not chat_id:
+        log.error("Telegram bot_token or chat_id is empty")
+        return False
+    if not 2 <= len(images) <= 10:
+        log.error("Telegram media group requires 2-10 images, got %d", len(images))
+        return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMediaGroup"
+    media = []
+    files = {}
+    for idx, (filename, image_bytes) in enumerate(images):
+        field = f"photo{idx}"
+        item = {"type": "photo", "media": f"attach://{field}"}
+        if idx == 0 and caption is not None:
+            item["caption"] = caption
+            item["parse_mode"] = parse_mode
+        media.append(item)
+        files[field] = (filename, image_bytes, "image/png")
+
+    for attempt in range(max_retries):
+        try:
+            data = {"chat_id": str(chat_id), "media": json.dumps(media)}
+            response = requests.post(url, data=data, files=files, timeout=45)
+            resp_json = response.json()
+            if response.status_code == 200 and resp_json.get("ok"):
+                return True
+            log.error(
+                "Telegram sendMediaGroup error (attempt %d): %s",
+                attempt + 1,
+                resp_json.get("description", response.status_code),
+            )
+        except requests.RequestException as e:
+            log.error("Telegram sendMediaGroup failed (attempt %d): %s",
+                      attempt + 1, e)
+
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)
+
+    return False
+
+
 def send_telegram_document(document_bytes, bot_token, chat_id,
                            caption=None, filename="document",
                            max_retries=3):

@@ -1,8 +1,8 @@
 [Unit]
-Description=Run selectel-monitor every hour
+Description=Run selectel-monitor every morning
 
 [Timer]
-OnCalendar=*-*-* *:00:00
+OnCalendar=*-*-* 09:00:00 Europe/Moscow
 AccuracySec=1min
 Persistent=true
 Unit=selectel-monitor-check.service

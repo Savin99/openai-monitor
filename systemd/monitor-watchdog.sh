@@ -31,7 +31,6 @@ ACTIVE_UNITS=(
   "openai-monitor-status.timer"
   "openai-monitor-backup.timer"
   "sber-monitor-check.timer"
-  "sber-monitor-final-warning.timer"
   "sber-monitor-friday-reminder.timer"
   "selectel-monitor-check.timer"
   "vdska-monitor-check.timer"
@@ -47,39 +46,66 @@ for unit in "${ACTIVE_UNITS[@]}"; do
 done
 
 # ── layer 2: heartbeat freshness ──────────────────────────────────────────────
-# unit → max_age_seconds. Slack beyond nominal cadence handles clock jitter,
-# boot-time backlog (OnBootSec=5min), and the weekday-only quirks where
-# sber-* units skip weekends.
-declare -A MAX_AGE=(
-  ["openai-monitor-check"]=5400          # hourly  +  slack → 1.5h
-  ["openai-monitor-status"]=93600        # daily   +  slack → 26h
-  ["openai-monitor-backup"]=93600        # daily   +  slack → 26h
-  ["sber-monitor-check"]=86400           # hourly during 15–19 MSK weekdays;
-                                          #  heartbeat refreshed on every fire,
-                                          #  generous 24h because weekends skip
-  ["sber-monitor-final-warning"]=259200  # daily on weekdays → 3 days across weekend
-  ["sber-monitor-friday-reminder"]=691200 # weekly → 8 days
-  ["selectel-monitor-check"]=5400        # hourly  +  slack → 1.5h
-  ["vdska-monitor-check"]=5400           # hourly  +  slack → 1.5h
+# unit → timer. Compare heartbeat with the timer's actual LastTriggerUSec instead
+# of hard-coding cadence in two places. If a timer schedule changes from hourly to
+# daily, watchdog follows systemd and will not create false stale alerts.
+declare -A HEARTBEAT_TIMERS=(
+  ["openai-monitor-check"]="openai-monitor-check.timer"
+  ["openai-monitor-status"]="openai-monitor-status.timer"
+  ["openai-monitor-backup"]="openai-monitor-backup.timer"
+  ["sber-monitor-check"]="sber-monitor-check.timer"
+  ["sber-monitor-friday-reminder"]="sber-monitor-friday-reminder.timer"
+  ["selectel-monitor-check"]="selectel-monitor-check.timer"
+  ["vdska-monitor-check"]="vdska-monitor-check.timer"
 )
+
+declare -A HEARTBEAT_GRACE=(
+  ["sber-monitor-friday-reminder"]=3600
+)
+DEFAULT_HEARTBEAT_GRACE=1800
+
+timer_last_trigger_ts() {
+  local timer="$1"
+  local raw
+  raw="$(systemctl show "$timer" --property=LastTriggerUSec --value 2>/dev/null || true)"
+  if [[ -z "$raw" || "$raw" == "n/a" || "$raw" == "0" ]]; then
+    return 1
+  fi
+  date -d "$raw" +%s 2>/dev/null
+}
 
 HEARTBEAT_DIR=/var/lib/monitor/heartbeat
 now=$(date +%s)
 stale=()
-for unit in "${!MAX_AGE[@]}"; do
+for unit in "${!HEARTBEAT_TIMERS[@]}"; do
   hb="$HEARTBEAT_DIR/${unit}.ts"
+  timer="${HEARTBEAT_TIMERS[$unit]}"
+  grace="${HEARTBEAT_GRACE[$unit]:-$DEFAULT_HEARTBEAT_GRACE}"
+  last_trigger="$(timer_last_trigger_ts "$timer" || true)"
+
   if [[ ! -f $hb ]]; then
-    # Missing file — might be brand-new deploy. Warn, but tag clearly.
-    stale+=("${unit}: heartbeat file missing ($hb)")
+    if [[ -n "$last_trigger" ]]; then
+      lag=$(( now - last_trigger ))
+      if (( lag > grace )); then
+        stale+=("${unit}: heartbeat file missing after ${timer} fired $(( lag / 60 ))m ago")
+      fi
+    else
+      stale+=("${unit}: heartbeat file missing and ${timer} has no trigger history")
+    fi
     continue
   fi
+
   ts=$(cat "$hb" 2>/dev/null || echo 0)
-  age=$(( now - ts ))
-  max=${MAX_AGE[$unit]}
-  if (( age > max )); then
-    age_h=$(( age / 3600 ))
-    max_h=$(( max / 3600 ))
-    stale+=("${unit}: heartbeat ${age_h}h old (>${max_h}h threshold)")
+  if [[ -z "$last_trigger" ]]; then
+    continue
+  fi
+
+  lag=$(( last_trigger - ts ))
+  if (( lag > grace )); then
+    trigger_age=$(( now - last_trigger ))
+    if (( trigger_age > grace )); then
+      stale+=("${unit}: heartbeat older than ${timer} last trigger by $(( lag / 60 ))m (>$(( grace / 60 ))m grace)")
+    fi
   fi
 done
 

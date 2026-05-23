@@ -1,5 +1,5 @@
 [Unit]
-Description=Selectel email monitor — forward no-reply@selectel.ru notifications to Telegram
+Description=Selectel API balance monitor
 After=network-online.target
 Wants=network-online.target
 OnFailure=monitor-alert@%N.service
@@ -7,10 +7,8 @@ OnFailure=monitor-alert@%N.service
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/openai_monitor
-Environment=GMAIL_SENDER_FILTER=no-reply@selectel.ru
-Environment=GMAIL_LOOKBACK=2d
-Environment=SELECTEL_BODY_PREVIEW_LEN=500
+EnvironmentFile=/etc/default/monitor-telegram
+EnvironmentFile=/etc/default/selectel-monitor
+Environment=SELECTEL_MONITOR_MODE=api
 Environment=SELECTEL_SERVICE_LABEL=Selectel
-Environment=TELEGRAM_BOT_TOKEN=REPLACE_ME
-Environment=TELEGRAM_CHAT_ID=REPLACE_ME
 ExecStart=/usr/bin/python3 /opt/openai_monitor/selectel_monitor.py

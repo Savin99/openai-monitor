@@ -17,6 +17,7 @@ Usage:
 """
 
 import base64
+import fcntl
 import json
 import logging
 import os
@@ -114,6 +115,9 @@ CONFIG = {
     "alert_timezone": os.environ.get("SBER_ALERT_TIMEZONE", "Europe/Moscow"),
     "alert_hour_start": int(os.environ.get("SBER_ALERT_HOUR_START", "15")),
     "alert_hour_end": int(os.environ.get("SBER_ALERT_HOUR_END", "19")),
+    "alert_start_time": os.environ.get("SBER_ALERT_START_TIME", ""),
+    "alert_end_time": os.environ.get("SBER_ALERT_END_TIME", ""),
+    "alert_dedupe": os.environ.get("SBER_ALERT_DEDUPE", "hour"),
     "account_labels": _parse_labels(os.environ.get("SBER_ACCOUNT_LABELS", "")),
     "client_cert_file": os.environ.get("SBER_CLIENT_CERT_FILE", ""),
     "client_key_file": os.environ.get("SBER_CLIENT_KEY_FILE", ""),
@@ -173,11 +177,30 @@ def save_tokens(tokens):
         json.dump(tokens, f, indent=2, ensure_ascii=False)
 
 
+def _token_lock_path():
+    return TOKENS_FILE.resolve().with_name(".sber_tokens.lock")
+
+
+def _open_token_lock():
+    lock_path = _token_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        os.chmod(lock_path, 0o666)
+    except OSError:
+        pass
+    return os.fdopen(fd, "r+")
+
+
 def refresh_access_token(tokens):
     """Обменять refresh_token на новую пару access/refresh."""
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
         raise SystemExit("refresh_token отсутствует — нужна повторная авторизация")
+    if not CONFIG["client_secret"]:
+        raise SystemExit(
+            "Missing env vars: client_secret is required to refresh access token"
+        )
 
     url = f"{CONFIG['oauth_base']}/ic/sso/api/v2/oauth/token"
     basic = base64.b64encode(
@@ -188,7 +211,12 @@ def refresh_access_token(tokens):
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
-    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CONFIG["client_id"],
+        "client_secret": CONFIG["client_secret"],
+    }
 
     resp = _sber_request(
         "POST",
@@ -221,14 +249,16 @@ def refresh_access_token(tokens):
 
 
 def get_valid_access_token(force_refresh=False):
-    tokens = load_tokens()
-    now = int(time.time())
-    expires_at = tokens.get("expires_at", 0)
-    # Refresh if less than 5 min left
-    if force_refresh or expires_at - now < 300:
-        log.info("Access token expired or close to expiring, refreshing...")
-        tokens = refresh_access_token(tokens)
-    return tokens["access_token"], tokens
+    with _open_token_lock() as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        tokens = load_tokens()
+        now = int(time.time())
+        expires_at = tokens.get("expires_at", 0)
+        # Refresh if less than 5 min left
+        if force_refresh or expires_at - now < 300:
+            log.info("Access token expired or close to expiring, refreshing...")
+            tokens = refresh_access_token(tokens)
+        return tokens["access_token"], tokens
 
 
 def check_refresh_token_expiry(tokens):
@@ -537,12 +567,62 @@ def now_in_alert_tz():
     return datetime.now(ZoneInfo(CONFIG["alert_timezone"]))
 
 
+def _parse_alert_time(value, fallback_hour, fallback_minute):
+    if not value:
+        return fallback_hour, fallback_minute
+    try:
+        hour_text, minute_text = str(value).split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid alert time {value!r}, expected HH:MM")
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"Invalid alert time {value!r}, expected HH:MM")
+    return hour, minute
+
+
+def alert_window_bounds():
+    start = _parse_alert_time(
+        CONFIG.get("alert_start_time"),
+        CONFIG["alert_hour_start"],
+        0,
+    )
+    end = _parse_alert_time(
+        CONFIG.get("alert_end_time"),
+        CONFIG["alert_hour_end"],
+        59,
+    )
+    return start, end
+
+
+def _format_hhmm(value):
+    return f"{value[0]:02d}:{value[1]:02d}"
+
+
+def alert_window_label():
+    start, end = alert_window_bounds()
+    return f"{_format_hhmm(start)}–{_format_hhmm(end)} ({CONFIG['alert_timezone']})"
+
+
+def alert_window_end_label():
+    _, end = alert_window_bounds()
+    return _format_hhmm(end)
+
+
 def in_alert_window(now=None):
-    """True если текущий час (в alert_timezone) в пределах [start, end]."""
+    """True если текущее время (в alert_timezone) внутри alert window."""
     now = now or now_in_alert_tz()
-    start = CONFIG["alert_hour_start"]
-    end = CONFIG["alert_hour_end"]
-    return start <= now.hour <= end
+    start, end = alert_window_bounds()
+    current = (now.hour, now.minute)
+    if start <= end:
+        return start <= current <= end
+    return current >= start or current <= end
+
+
+def current_alert_key(now):
+    if CONFIG.get("alert_dedupe") == "minute":
+        return now.strftime("%Y-%m-%dT%H:%M")
+    return now.strftime("%Y-%m-%dT%H")
 
 
 def build_status_message(accounts, above, sber_state):
@@ -551,10 +631,7 @@ def build_status_message(accounts, above, sber_state):
     threshold_str = f"{threshold:,.0f}".replace(",", " ")
     lines = ["<b>СберБизнес — Статус р/с</b>\n"]
     lines.append(f"Порог на одном счёте: {threshold_str} ₽")
-    lines.append(
-        f"Окно алертов: {CONFIG['alert_hour_start']:02d}:00–"
-        f"{CONFIG['alert_hour_end']:02d}:59 ({CONFIG['alert_timezone']})"
-    )
+    lines.append(f"Окно алертов: {alert_window_label()}")
     if above:
         lines.append(f"Статус: <b>превышение на {len(above)} сч.</b>")
         if in_alert_window(now):
@@ -562,13 +639,13 @@ def build_status_message(accounts, above, sber_state):
         else:
             lines.append(
                 f"Сейчас вне окна ({now.strftime('%H:%M')}) — "
-                f"тишина до {CONFIG['alert_hour_start']:02d}:00."
+                f"тишина до {_format_hhmm(alert_window_bounds()[0])}."
             )
     else:
         lines.append("Статус: ни на одном счёте нет превышения — OK")
-    last_alert_hour = sber_state.get("last_alert_hour")
-    if last_alert_hour:
-        lines.append(f"Последний алерт: {last_alert_hour}")
+    last_alert_key = sber_state.get("last_alert_key") or sber_state.get("last_alert_hour")
+    if last_alert_key:
+        lines.append(f"Последний алерт: {last_alert_key}")
     lines.append("\nСчета:")
     lines.append(format_accounts(accounts, highlight_threshold=threshold))
     return "\n".join(lines)
@@ -598,7 +675,14 @@ def check_and_alert(force_refresh=False):
         access_token, tokens = get_valid_access_token(force_refresh=force_refresh)
         check_refresh_token_expiry(tokens)
 
-        raw_accounts = get_client_accounts(access_token)
+        try:
+            raw_accounts = get_client_accounts(access_token)
+        except RuntimeError as e:
+            if "client-info failed: HTTP 401" not in str(e):
+                raise
+            log.info("Access token was rejected by Sber, refreshing and retrying...")
+            access_token, tokens = get_valid_access_token(force_refresh=True)
+            raw_accounts = get_client_accounts(access_token)
         accounts = filter_rub_current_accounts(raw_accounts)
 
         statement_date = now.strftime("%Y-%m-%d")
@@ -610,10 +694,10 @@ def check_and_alert(force_refresh=False):
     threshold = CONFIG["balance_threshold"]
     above = [a for a in accounts if a.get("balance", 0) > threshold]
 
-    current_hour_key = now.strftime("%Y-%m-%dT%H")
+    alert_key = current_alert_key(now)
 
     sber_state = get_sber_state()
-    last_alert_hour = sber_state.get("last_alert_hour")
+    last_alert_key = sber_state.get("last_alert_key") or sber_state.get("last_alert_hour")
     now_ts = int(now.timestamp())
     update_balance_change_history(accounts, sber_state, now_ts=now_ts)
     _mark_sber_api_reached(sber_state)
@@ -624,17 +708,17 @@ def check_and_alert(force_refresh=False):
     print(f"Now in {CONFIG['alert_timezone']}: {now.strftime('%Y-%m-%d %H:%M')}")
 
     if not above:
-        if last_alert_hour:
+        if last_alert_key:
             print("Ни на одном счёте нет превышения, clearing alert state")
+        sber_state["last_alert_key"] = None
         sber_state["last_alert_hour"] = None
     elif not in_alert_window(now):
         print(
-            f"Outside alert window ({CONFIG['alert_hour_start']:02d}:00–"
-            f"{CONFIG['alert_hour_end']:02d}:59), skip"
+            f"Outside alert window ({alert_window_label()}), skip"
         )
-    elif last_alert_hour == current_hour_key:
+    elif last_alert_key == alert_key:
         print(
-            f"Already alerted this hour ({current_hour_key}), skip to avoid duplicate"
+            f"Already alerted for this slot ({alert_key}), skip to avoid duplicate"
         )
     else:
         above_lines = []
@@ -643,19 +727,25 @@ def check_and_alert(force_refresh=False):
             balance_str = f"{a['balance']:,.2f}".replace(",", " ")
             stale = format_stale_note(a.get("accountNumber"), sber_state, now_ts=now_ts)
             above_lines.append(f"  {label}: <b>{balance_str} ₽</b>{stale}")
+        cadence = (
+            "каждые 10 минут"
+            if CONFIG.get("alert_dedupe") == "minute"
+            else "каждый час"
+        )
         message = (
             f"🚨 <b>СберБизнес — положи деньги на депозит</b>\n\n"
             f"Превышение порога {threshold_str} ₽ на счетах:\n"
             + "\n".join(above_lines)
             + f"\n\nВремя: {now.strftime('%d.%m.%Y %H:%M')} "
             f"({CONFIG['alert_timezone']})\n"
-            f"Алерты будут приходить каждый час до "
-            f"{CONFIG['alert_hour_end']:02d}:59, "
+            f"Алерты будут приходить {cadence} до "
+            f"{alert_window_end_label()}, "
             f"пока остаток не опустится под порог."
         )
         if _alert(message):
-            print(f"Alert sent for hour {current_hour_key}")
-            sber_state["last_alert_hour"] = current_hour_key
+            print(f"Alert sent for slot {alert_key}")
+            sber_state["last_alert_key"] = alert_key
+            sber_state["last_alert_hour"] = alert_key
         else:
             print("Failed to send alert")
             sber_state["last_accounts"] = accounts

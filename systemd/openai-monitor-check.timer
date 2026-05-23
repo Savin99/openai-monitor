@@ -1,0 +1,12 @@
+[Unit]
+Description=Run openai-monitor balance check every hour
+
+[Timer]
+OnBootSec=5min
+OnCalendar=hourly
+AccuracySec=1min
+Persistent=true
+Unit=openai-monitor-check.service
+
+[Install]
+WantedBy=timers.target

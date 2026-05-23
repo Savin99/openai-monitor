@@ -1,6 +1,7 @@
 __pycache__/
 monitor_state.json
 sber_tokens.json
+sber_tokens.json.bak-token-split-*
 .sber_auth_certs/
 sber_client*.p12
 sber_client*.pem

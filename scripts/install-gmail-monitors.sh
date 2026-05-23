@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Idempotent installer for selectel-monitor + vdska-monitor + watchdog updates
-# + Sber alert window narrowing + healthchecks.io ping URL.
+# + Sber evening alert cadence + healthchecks.io ping URL.
 #
 # Designed to run ON THE VPS via the self-hosted GitHub Actions runner —
 # no inbound SSH required, sidesteps fail2ban entirely.
@@ -48,11 +48,16 @@ done
 echo "==> install watchdog"
 install -m 755 systemd/monitor-watchdog.sh /usr/local/bin/monitor-watchdog.sh
 
-# ── 4) narrow Sber alert window 23 → 19 (no-op if already 19) ─────────────────
-if [[ -f "$SBER_UNIT" ]] && grep -q '^Environment=SBER_ALERT_HOUR_END=23$' "$SBER_UNIT"; then
-  echo "==> tighten SBER_ALERT_HOUR_END 23 → 19"
-  sed -i 's|^Environment=SBER_ALERT_HOUR_END=23$|Environment=SBER_ALERT_HOUR_END=19|' "$SBER_UNIT"
-fi
+# ── 4) Sber evening alert cadence ─────────────────────────────────────────────
+echo "==> install Sber check timer + alert-window drop-in"
+install -m 644 systemd/sber-monitor-check.timer \
+  /etc/systemd/system/sber-monitor-check.timer
+install -D -m 644 systemd/drop-ins/sber-monitor-check.service.alert-window.conf \
+  /etc/systemd/system/sber-monitor-check.service.d/alert-window.conf
+
+# The 19:10/19:20/.../20:00 check timer replaces the old standalone final
+# warning, otherwise 19:50 would generate a duplicate alert.
+systemctl disable --now sber-monitor-final-warning.timer || true
 
 # ── 5) optional: register HEALTHCHECKS_URL into env-file (idempotent) ─────────
 if [[ -n "${HEALTHCHECKS_URL:-}" ]]; then
@@ -99,11 +104,8 @@ systemctl daemon-reload
 echo "==> enable + start selectel/vdska timers"
 systemctl enable --now selectel-monitor-check.timer vdska-monitor-check.timer
 
-# Restart sber to pick up new SBER_ALERT_HOUR_END (timer fires the service,
-# which is oneshot — restarting the .service is a no-op, but next timer fire
-# will read the new env. Force-start once to verify.)
-echo "==> trigger sber-monitor-check once (validates new env + tests connectivity)"
-systemctl start sber-monitor-check.service || true
+echo "==> enable + start sber check timer"
+systemctl enable --now sber-monitor-check.timer
 
 # ── 8) smoke ──────────────────────────────────────────────────────────────────
 echo "==> smoke: trigger selectel + vdska oneshots"

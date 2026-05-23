@@ -1,0 +1,13 @@
+[Unit]
+Description=Run sber-monitor-check hourly from 15:00, then every 10 minutes after 19:00 MSK
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15..19:00:00 Europe/Moscow
+OnCalendar=Mon..Fri *-*-* 19:10/10:00 Europe/Moscow
+OnCalendar=Mon..Fri *-*-* 20:00:00 Europe/Moscow
+AccuracySec=1min
+Persistent=true
+Unit=sber-monitor-check.service
+
+[Install]
+WantedBy=timers.target

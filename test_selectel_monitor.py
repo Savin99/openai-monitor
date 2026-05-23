@@ -10,10 +10,12 @@
 import base64
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import requests
 import selectel_monitor
 
 
@@ -52,6 +54,306 @@ class FormatForTelegramTests(unittest.TestCase):
         msg = {"subject": "S", "body": ""}
         out = selectel_monitor.format_for_telegram(msg, "Selectel", 500)
         self.assertIn("<b>S</b>", out)
+
+
+class SelectelApiTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_config = dict(selectel_monitor.CONFIG)
+        selectel_monitor.CONFIG.update(
+            {
+                "api_token": "token",
+                "api_base_url": "https://api.selectel.ru",
+                "balance_threshold": 1000.0,
+                "amount_scale": 100.0,
+                "telegram_bot_token": "tg",
+                "telegram_chat_id": "42",
+                "alert_timezone": "Europe/Moscow",
+                "topup_lookup_days": 365,
+            }
+        )
+
+    def tearDown(self):
+        selectel_monitor.CONFIG.clear()
+        selectel_monitor.CONFIG.update(self._orig_config)
+
+    def _response(self, status=200, payload=None, text=""):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.json.return_value = payload or {}
+        resp.text = text or json.dumps(payload or {})
+        return resp
+
+    def test_selectel_get_uses_x_token(self):
+        with patch(
+            "selectel_monitor.requests.get",
+            return_value=self._response(payload={"status": "success"}),
+        ) as mock_get:
+            out = selectel_monitor._selectel_get("/v3/balances")
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(mock_get.call_args.kwargs["headers"]["X-Token"], "token")
+        self.assertEqual(
+            mock_get.call_args.args[0], "https://api.selectel.ru/v3/balances"
+        )
+
+    def test_selectel_get_raises_on_http_error(self):
+        with patch(
+            "selectel_monitor.requests.get",
+            return_value=self._response(status=401, text="bad token"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+                selectel_monitor._selectel_get("/v3/balances")
+
+    def test_selectel_get_raises_on_network_error(self):
+        with patch(
+            "selectel_monitor.requests.get",
+            side_effect=requests.Timeout("slow"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "network"):
+                selectel_monitor._selectel_get("/v3/balances")
+
+    def test_summarize_balances(self):
+        payload = {
+            "data": {
+                "settings": {"currency": "RUB"},
+                "debt_status": "clean",
+                "billings": [
+                    {
+                        "billing_type": "primary",
+                        "balances_values_sum": 150000,
+                        "debt_sum": 10000,
+                        "final_sum": 140000,
+                        "balances": [
+                            {"balance_type": "main", "value": 120000},
+                            {"balance_type": "bonus", "value": 30000},
+                        ],
+                    }
+                ],
+            }
+        }
+        summary = selectel_monitor.summarize_balances(payload)
+        self.assertEqual(summary["currency"], "RUB")
+        self.assertEqual(summary["total_final"], 1400)
+        self.assertEqual(summary["total_debt"], 100)
+        self.assertEqual(summary["billings"][0]["balances"][0]["type"], "main")
+
+    def test_format_api_status_is_human_readable(self):
+        summary = {
+            "currency": "RUB",
+            "debt_status": "Success",
+            "total_balances": 112851.66,
+            "total_debt": 0,
+            "total_final": 112851.66,
+            "billings": [
+                {
+                    "type": "primary",
+                    "final_sum": 112851.66,
+                    "balances": [
+                        {"type": "main", "value": 112851.66},
+                        {"type": "bonus", "value": 0},
+                    ],
+                }
+            ],
+        }
+        msg = selectel_monitor.format_api_status(
+            summary, {"data": {"primary": 286, "storage": None}}
+        )
+        self.assertIn("Selectel — баланс", msg)
+        self.assertIn("Сейчас: <b>112 851.66 RUB</b>", msg)
+        self.assertIn("Порог: 1 000.00 RUB", msg)
+        self.assertIn("Задолженность: нет задолженности", msg)
+        self.assertIn("Хватит примерно", msg)
+        self.assertIn("Основной баланс", msg)
+        self.assertNotIn("Debt status", msg)
+        self.assertNotIn("None", msg)
+        self.assertNotIn("bonus 0.00", msg)
+
+    def test_summarize_transactions_reconstructs_history(self):
+        payload = {
+            "data": [
+                {
+                    "created": "2026-05-14T10:00:00",
+                    "price": 1000000,
+                    "public_description": {"ru": "Пополнение баланса"},
+                    "dir": "incoming",
+                },
+                {
+                    "created": "2026-05-15T10:00:00",
+                    "price": -250000,
+                    "public_description": {"ru": "Оплата услуг"},
+                    "dir": "outgoing",
+                },
+            ]
+        }
+        out = selectel_monitor.summarize_transactions(
+            payload,
+            11250,
+            "RUB",
+            now=datetime(2026, 5, 16, 12, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(out["incoming"], 10000)
+        self.assertEqual(out["outgoing"], 2500)
+        self.assertEqual(out["outgoing_yesterday"], 2500)
+        self.assertEqual(out["outgoing_week"], 2500)
+        self.assertEqual(out["last_payment"]["date"], "14.05.2026")
+        self.assertEqual(out["last_payment"]["days_since"], 2)
+        self.assertEqual(len(out["payments"]), 1)
+        self.assertEqual(out["history"][-1]["balance"], 11250)
+        self.assertEqual(out["history"][0]["balance"], 3750)
+
+    def test_format_api_report_includes_transactions(self):
+        summary = {
+            "currency": "RUB",
+            "debt_status": "Success",
+            "total_balances": 112851.66,
+            "total_debt": 0,
+            "total_final": 112851.66,
+            "billings": [],
+        }
+        tx = {
+            "incoming": 10000,
+            "outgoing": 2500,
+            "outgoing_yesterday": 500,
+            "outgoing_week": 2000,
+            "last_payment": {
+                "date": "14.05.2026",
+                "amount": 10000,
+                "days_since": 2,
+            },
+            "payments": [
+                {"ts": "2026-05-14T10:00:00+00:00", "amount": 10000}
+            ],
+        }
+        msg = selectel_monitor.format_api_report(summary, transactions=tx)
+        self.assertIn("Вчера: 500.00 RUB", msg)
+        self.assertIn("За 7 дней: 2 000.00 RUB", msg)
+        self.assertIn("Последнее пополнение: 14.05.2026", msg)
+        self.assertIn("+10 000.00 RUB (2 дн. назад)", msg)
+        self.assertIn("За 90 дней", msg)
+        self.assertIn("Списано: 2 500.00 RUB", msg)
+        self.assertNotIn("Пополнено:", msg)
+
+    def test_check_api_balance_sends_only_when_low_or_forced(self):
+        high = {
+            "data": {
+                "settings": {"currency": "RUB"},
+                "billings": [{"billing_type": "primary", "final_sum": 150000}],
+            }
+        }
+        with (
+            patch("selectel_monitor.fetch_selectel_balances", return_value=high),
+            patch("selectel_monitor.fetch_selectel_prediction", return_value={}),
+            patch(
+                "selectel_monitor.fetch_selectel_transactions",
+                return_value={"data": []},
+            ),
+            patch("selectel_monitor.record_api_history", return_value=[]),
+            patch("selectel_monitor.send_api_report", return_value=True) as send,
+        ):
+            selectel_monitor.check_api_balance()
+            send.assert_not_called()
+            selectel_monitor.check_api_balance(send_ok_status=True)
+            send.assert_called_once()
+
+    def test_check_api_balance_loads_last_topup_when_outside_report_window(self):
+        high = {
+            "data": {
+                "settings": {"currency": "RUB"},
+                "billings": [{"billing_type": "primary", "final_sum": 150000}],
+            }
+        }
+        recent_transactions = {
+            "data": [
+                {
+                    "created": "2026-05-15T10:00:00",
+                    "price": -250000,
+                    "public_description": {"ru": "Оплата услуг"},
+                    "dir": "outgoing",
+                },
+            ]
+        }
+        long_transactions = {
+            "data": [
+                {
+                    "created": "2026-04-01T10:00:00",
+                    "price": 1000000,
+                    "public_description": {"ru": "Пополнение баланса"},
+                    "dir": "incoming",
+                },
+            ]
+        }
+        with (
+            patch("selectel_monitor.fetch_selectel_balances", return_value=high),
+            patch("selectel_monitor.fetch_selectel_prediction", return_value={}),
+            patch(
+                "selectel_monitor.fetch_selectel_transactions",
+                side_effect=[recent_transactions, long_transactions],
+            ) as fetch_transactions,
+            patch("selectel_monitor.record_api_history", return_value=[]),
+            patch("selectel_monitor.send_api_report", return_value=True) as send,
+        ):
+            selectel_monitor.check_api_balance(send_ok_status=True)
+
+        self.assertEqual(fetch_transactions.call_count, 2)
+        self.assertEqual(
+            fetch_transactions.call_args_list[1].kwargs["days"],
+            selectel_monitor.CONFIG["topup_lookup_days"],
+        )
+        sent_transactions = send.call_args.args[2]
+        self.assertEqual(sent_transactions["last_payment"]["amount"], 10000)
+
+    def test_check_api_balance_alerts_when_low(self):
+        low = {
+            "data": {
+                "settings": {"currency": "RUB"},
+                "billings": [{"billing_type": "primary", "final_sum": 90000}],
+            }
+        }
+        with (
+            patch("selectel_monitor.fetch_selectel_balances", return_value=low),
+            patch(
+                "selectel_monitor.fetch_selectel_prediction",
+                return_value={"data": {"primary": 48}},
+            ),
+            patch(
+                "selectel_monitor.fetch_selectel_transactions",
+                return_value={"data": []},
+            ),
+            patch("selectel_monitor.record_api_history", return_value=[]),
+            patch("selectel_monitor._today_in_alert_timezone", return_value="2026-05-20"),
+            patch("selectel_monitor.load_state", return_value={}),
+            patch("selectel_monitor.save_state"),
+            patch("selectel_monitor.send_api_report", return_value=True) as send,
+        ):
+            selectel_monitor.check_api_balance()
+        send.assert_called_once()
+        self.assertTrue(send.call_args.kwargs["force_alert"])
+
+    def test_check_api_balance_sends_low_alert_once_per_day(self):
+        low = {
+            "data": {
+                "settings": {"currency": "RUB"},
+                "billings": [{"billing_type": "primary", "final_sum": 90000}],
+            }
+        }
+        state = {}
+
+        with (
+            patch("selectel_monitor.fetch_selectel_balances", return_value=low),
+            patch("selectel_monitor.fetch_selectel_prediction", return_value={}),
+            patch(
+                "selectel_monitor.fetch_selectel_transactions",
+                return_value={"data": []},
+            ),
+            patch("selectel_monitor.record_api_history", return_value=[]),
+            patch("selectel_monitor._today_in_alert_timezone", return_value="2026-05-20"),
+            patch("selectel_monitor.load_state", side_effect=lambda: state),
+            patch("selectel_monitor.save_state"),
+            patch("selectel_monitor.send_api_report", return_value=True) as send,
+        ):
+            selectel_monitor.check_api_balance()
+            selectel_monitor.check_api_balance()
+
+        send.assert_called_once()
 
 
 class ExtractBodyTests(unittest.TestCase):

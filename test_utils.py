@@ -192,6 +192,54 @@ class SendTelegramPhotoTests(unittest.TestCase):
                 utils.send_telegram_photo(b"X", "t", "c", max_retries=2))
 
 
+class SendTelegramMediaGroupTests(unittest.TestCase):
+    def _ok(self):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"ok": True}
+        return r
+
+    def _err(self, description="bad"):
+        r = MagicMock()
+        r.status_code = 400
+        r.json.return_value = {"ok": False, "description": description}
+        return r
+
+    def test_success_posts_album(self):
+        images = [("a.png", b"A"), ("b.png", b"B")]
+        with patch("utils.requests.post", return_value=self._ok()) as mock_post:
+            ok = utils.send_telegram_media_group(images, "TKN", "42", caption="hi")
+        self.assertTrue(ok)
+        url = mock_post.call_args.args[0]
+        self.assertIn("/sendMediaGroup", url)
+        self.assertIn("botTKN", url)
+        kwargs = mock_post.call_args.kwargs
+        self.assertEqual(kwargs["data"]["chat_id"], "42")
+        media = json.loads(kwargs["data"]["media"])
+        self.assertEqual(media[0]["media"], "attach://photo0")
+        self.assertEqual(media[0]["caption"], "hi")
+        self.assertEqual(media[1]["media"], "attach://photo1")
+        self.assertNotIn("caption", media[1])
+        self.assertEqual(kwargs["files"]["photo0"][0], "a.png")
+        self.assertEqual(kwargs["files"]["photo1"][1], b"B")
+
+    def test_rejects_invalid_album_size(self):
+        with patch("utils.requests.post") as mock_post:
+            self.assertFalse(utils.send_telegram_media_group([], "t", "c"))
+            self.assertFalse(
+                utils.send_telegram_media_group([("a.png", b"A")], "t", "c")
+            )
+        mock_post.assert_not_called()
+
+    def test_retries_on_error_then_success(self):
+        images = [("a.png", b"A"), ("b.png", b"B")]
+        with patch("utils.requests.post",
+                   side_effect=[self._err(), self._ok()]), \
+             patch("utils.time.sleep"):
+            ok = utils.send_telegram_media_group(images, "t", "c", max_retries=2)
+        self.assertTrue(ok)
+
+
 class SendTelegramDocumentTests(unittest.TestCase):
     def _ok(self):
         r = MagicMock()

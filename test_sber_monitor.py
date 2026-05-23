@@ -223,6 +223,9 @@ class CheckAndAlertTests(unittest.TestCase):
                 "alert_timezone": "Europe/Moscow",
                 "alert_hour_start": 15,
                 "alert_hour_end": 23,
+                "alert_start_time": "",
+                "alert_end_time": "",
+                "alert_dedupe": "hour",
             }
         )
 
@@ -413,6 +416,38 @@ class CheckAndAlertTests(unittest.TestCase):
         mock_alert, sber = self._run(balances=[7_000_000], fake_now=t17)
         mock_alert.assert_called_once()
         self.assertEqual(sber["last_alert_hour"], "2026-04-15T17")
+
+    def test_ten_minute_evening_slots(self):
+        sber_monitor.CONFIG.update(
+            {
+                "alert_start_time": "19:10",
+                "alert_end_time": "20:00",
+                "alert_dedupe": "minute",
+            }
+        )
+
+        t1909 = datetime(2026, 4, 15, 19, 9, tzinfo=self.TZ)
+        mock_alert, sber = self._run(balances=[6_000_000], fake_now=t1909)
+        mock_alert.assert_not_called()
+
+        t1910 = datetime(2026, 4, 15, 19, 10, tzinfo=self.TZ)
+        mock_alert, sber = self._run(balances=[6_000_000], fake_now=t1910)
+        mock_alert.assert_called_once()
+        self.assertEqual(sber["last_alert_key"], "2026-04-15T19:10")
+
+        t1920 = datetime(2026, 4, 15, 19, 20, tzinfo=self.TZ)
+        mock_alert, sber = self._run(balances=[6_000_000], fake_now=t1920)
+        mock_alert.assert_called_once()
+        self.assertEqual(sber["last_alert_key"], "2026-04-15T19:20")
+
+        t2000 = datetime(2026, 4, 15, 20, 0, tzinfo=self.TZ)
+        mock_alert, sber = self._run(balances=[6_000_000], fake_now=t2000)
+        mock_alert.assert_called_once()
+        self.assertEqual(sber["last_alert_key"], "2026-04-15T20:00")
+
+        t2001 = datetime(2026, 4, 15, 20, 1, tzinfo=self.TZ)
+        mock_alert, sber = self._run(balances=[6_000_000], fake_now=t2001)
+        mock_alert.assert_not_called()
 
 
 class SendFinalWarningTests(unittest.TestCase):
@@ -1028,6 +1063,8 @@ class RefreshAccessTokenTests(unittest.TestCase):
         call_kwargs = mock_request.call_args.kwargs
         self.assertEqual(call_kwargs["data"]["grant_type"], "refresh_token")
         self.assertEqual(call_kwargs["data"]["refresh_token"], "old_refresh")
+        self.assertEqual(call_kwargs["data"]["client_id"], "cid")
+        self.assertEqual(call_kwargs["data"]["client_secret"], "csecret")
 
         self.assertEqual(new["access_token"], "new_access")
         self.assertEqual(new["refresh_token"], "new_refresh")
@@ -1053,6 +1090,20 @@ class RefreshAccessTokenTests(unittest.TestCase):
         self.assertEqual(new["refresh_token"], "keep_me")
         # refresh_issued_at не должен обновиться, т.к. сам refresh_token не новый
         self.assertEqual(new["refresh_issued_at"], old["refresh_issued_at"])
+
+    def test_refresh_requires_client_secret(self):
+        old = {
+            "access_token": "old",
+            "refresh_token": "refresh",
+            "expires_at": 0,
+            "issued_at": 0,
+        }
+        sber_monitor.CONFIG["client_secret"] = ""
+        with patch("sber_monitor.requests.request") as mock_request:
+            with self.assertRaises(SystemExit) as cm:
+                sber_monitor.refresh_access_token(old)
+        self.assertIn("client_secret", str(cm.exception))
+        mock_request.assert_not_called()
 
 
 class RefreshTokenExpiryTests(unittest.TestCase):

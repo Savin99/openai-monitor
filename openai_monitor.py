@@ -16,6 +16,7 @@ from utils import load_state as _load_state_raw, save_state as _save_state_raw
 from utils import (
     send_telegram_alert as _send_telegram_alert_raw,
     send_telegram_document as _send_telegram_document_raw,
+    send_telegram_media_group as _send_telegram_media_group_raw,
     send_telegram_photo as _send_telegram_photo_raw,
     touch_heartbeat,
 )
@@ -196,6 +197,18 @@ def get_today_costs():
     return cost
 
 
+def get_yesterday_costs():
+    """Get yesterday's UTC costs. Returns cost float or None."""
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    yesterday = today - timedelta(days=1)
+    cost, _err = get_costs_for_period(
+        int(yesterday.timestamp()), int(today.timestamp())
+    )
+    return cost
+
+
 def get_week_costs():
     """Get current week's costs (Monday to now)."""
     now = datetime.now(timezone.utc)
@@ -282,6 +295,13 @@ def get_daily_costs(num_days=30):
         result.append((d, round(per_day.get(d, 0), 4)))
         d += timedelta(days=1)
     return result
+
+
+def _empty_daily_costs(num_days=30):
+    """Return a zero-filled UTC day series when daily buckets are unavailable."""
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=num_days - 1)
+    return [(start + timedelta(days=i), 0) for i in range(num_days)]
 
 
 def get_line_item_costs(start_ts, end_ts=None):
@@ -417,6 +437,16 @@ def send_telegram_photo(photo_bytes, caption=None, filename="chart.png", max_ret
         CONFIG["telegram_chat_id"],
         caption=caption,
         filename=filename,
+        max_retries=max_retries,
+    )
+
+
+def send_telegram_media_group(images, caption=None, max_retries=3):
+    return _send_telegram_media_group_raw(
+        images,
+        CONFIG["telegram_bot_token"],
+        CONFIG["telegram_chat_id"],
+        caption=caption,
         max_retries=max_retries,
     )
 
@@ -585,7 +615,7 @@ def get_topup_history():
 def tg_api(method, **kwargs):
     """Call Telegram Bot API."""
     url = f"https://api.telegram.org/bot{CONFIG['telegram_bot_token']}/{method}"
-    resp = requests.post(url, json=kwargs)
+    resp = requests.post(url, json=kwargs, timeout=15)
     return resp.json()
 
 
@@ -1125,14 +1155,14 @@ def send_status_report():
         remaining = round(total_deposited - total_spent, 2)
         source = _format_manual_source(stale_age)
 
-    today_spent = get_today_costs()
+    yesterday_spent = get_yesterday_costs()
     forecast = forecast_days_remaining(remaining) if remaining is not None else None
 
     # 2) Build text caption (HTML)
     lines = ["<b>OpenAI API — Ежедневный статус</b>", ""]
     lines.append(f"Остаток: <b>${remaining}</b> ({source})")
     lines.append(
-        f"Потрачено сегодня: ${today_spent if today_spent is not None else '?'}"
+        f"Потрачено вчера: ${yesterday_spent if yesterday_spent is not None else '?'}"
     )
     lines.append(
         f"Потрачено за 2026: ${total_spent if total_spent is not None else '?'}"
@@ -1156,6 +1186,8 @@ def send_status_report():
         import charts  # local import so non-chart paths don't require matplotlib
 
         daily = get_daily_costs(30)
+        if not daily:
+            daily = _empty_daily_costs(30)
         # topups only for the charted window
         if daily:
             window_start = daily[0][0]
@@ -1167,7 +1199,7 @@ def send_status_report():
         else:
             topups_window = []
         line_items = get_month_line_item_costs()
-        png = charts.build_status_chart(
+        chart_kwargs = dict(
             daily_costs=daily,
             topup_events=topups_window,
             line_item_costs=line_items,
@@ -1176,16 +1208,17 @@ def send_status_report():
             forecast_days=forecast,
             title_suffix=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         )
+        chart_images = charts.build_status_charts(**chart_kwargs)
     except Exception as e:
         log.error("Chart build failed, falling back to text-only: %s", e)
-        png = None
+        chart_images = []
 
     # 4) Send
-    if png:
-        if send_telegram_photo(png, caption=caption, filename="status.png"):
-            print("Status report (chart) sent!")
+    if chart_images:
+        if send_telegram_media_group(chart_images, caption=caption):
+            print("Status report (chart album) sent!")
             return
-        print("sendPhoto failed, falling back to text-only")
+        print("sendMediaGroup failed, falling back to text-only")
 
     if send_telegram_alert(caption):
         print("Status report (text) sent!")

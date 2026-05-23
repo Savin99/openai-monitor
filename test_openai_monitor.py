@@ -238,6 +238,24 @@ class PeriodHelpersTests(StateIsolationMixin, unittest.TestCase):
         self.assertLessEqual(captured["start"], int(_t.time()))
         self.assertGreaterEqual(captured["start"], int(_t.time()) - 86400)
 
+    def test_get_yesterday_costs_uses_full_previous_utc_day(self):
+        captured = {}
+
+        def fake(start_ts, end_ts=None, **kw):
+            captured["start"] = start_ts
+            captured["end"] = end_ts
+            return (4.56, None)
+
+        with patch("openai_monitor.get_costs_for_period", side_effect=fake):
+            got = openai_monitor.get_yesterday_costs()
+        self.assertEqual(got, 4.56)
+
+        today = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        self.assertEqual(captured["start"], int((today - timedelta(days=1)).timestamp()))
+        self.assertEqual(captured["end"], int(today.timestamp()))
+
     def test_get_week_costs_start_is_monday(self):
         from datetime import datetime, timezone
 
@@ -684,7 +702,7 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
         """Build a common patch setup — returns stack as list of contextmanagers."""
         return [
             patch("openai_monitor.get_total_costs", return_value=(50.0, None)),
-            patch("openai_monitor.get_today_costs", return_value=5.0),
+            patch("openai_monitor.get_yesterday_costs", return_value=5.0),
             patch("openai_monitor.get_billing_balance", return_value=None),
             patch("openai_monitor.forecast_days_remaining", return_value=forecast),
             patch(
@@ -709,17 +727,28 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
             patches[3],
             patches[4],
             patches[5],
-            patch("charts.build_status_chart", return_value=b"\x89PNG-FAKE"),
             patch(
-                "openai_monitor.send_telegram_photo", return_value=True
-            ) as mock_photo,
+                "charts.build_status_charts",
+                return_value=[
+                    ("daily.png", b"\x89PNG-1"),
+                    ("balance.png", b"\x89PNG-2"),
+                    ("models.png", b"\x89PNG-3"),
+                ],
+            ),
+            patch(
+                "openai_monitor.send_telegram_media_group", return_value=True
+            ) as mock_album,
             patch("openai_monitor.send_telegram_alert") as mock_alert,
         ):
             openai_monitor.send_status_report()
-        mock_photo.assert_called_once()
+        mock_album.assert_called_once()
         # caption must include balance + forecast
-        caption = mock_photo.call_args.kwargs["caption"]
+        images = mock_album.call_args.args[0]
+        caption = mock_album.call_args.kwargs["caption"]
+        self.assertEqual([name for name, _ in images], ["daily.png", "balance.png", "models.png"])
         self.assertIn("100", caption)  # remaining = 150-50
+        self.assertIn("Потрачено вчера: $5.0", caption)
+        self.assertNotIn("Потрачено сегодня", caption)
         self.assertIn("10 дн", caption)
         mock_alert.assert_not_called()
 
@@ -734,18 +763,18 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
             patches[4],
             patches[5],
             patch(
-                "charts.build_status_chart", side_effect=RuntimeError("matplotlib died")
+                "charts.build_status_charts", side_effect=RuntimeError("matplotlib died")
             ),
-            patch("openai_monitor.send_telegram_photo") as mock_photo,
+            patch("openai_monitor.send_telegram_media_group") as mock_album,
             patch(
                 "openai_monitor.send_telegram_alert", return_value=True
             ) as mock_alert,
         ):
             openai_monitor.send_status_report()
-        mock_photo.assert_not_called()
+        mock_album.assert_not_called()
         mock_alert.assert_called_once()
 
-    def test_falls_back_to_text_when_sendPhoto_fails(self):
+    def test_falls_back_to_text_when_send_media_group_fails(self):
         self.write_state({"total_deposited": 150, "alert_threshold": 100})
         patches = self._common_patches()
         with (
@@ -755,17 +784,41 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
             patches[3],
             patches[4],
             patches[5],
-            patch("charts.build_status_chart", return_value=b"\x89PNG"),
             patch(
-                "openai_monitor.send_telegram_photo", return_value=False
-            ) as mock_photo,
+                "charts.build_status_charts",
+                return_value=[("daily.png", b"\x89PNG"), ("balance.png", b"\x89PNG")],
+            ),
+            patch(
+                "openai_monitor.send_telegram_media_group", return_value=False
+            ) as mock_album,
             patch(
                 "openai_monitor.send_telegram_alert", return_value=True
             ) as mock_alert,
         ):
             openai_monitor.send_status_report()
-        mock_photo.assert_called_once()
+        mock_album.assert_called_once()
         mock_alert.assert_called_once()
+
+    def test_chart_uses_zero_filled_daily_series_when_daily_api_empty(self):
+        self.write_state({"total_deposited": 150, "alert_threshold": 100})
+        patches = self._common_patches()
+        zero_daily = [(date_type(2026, 4, 1), 0), (date_type(2026, 4, 2), 0)]
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patch("openai_monitor.get_daily_costs", return_value=[]),
+            patches[5],
+            patch("openai_monitor._empty_daily_costs", return_value=zero_daily),
+            patch(
+                "charts.build_status_charts",
+                return_value=[("daily.png", b"\x89PNG"), ("balance.png", b"\x89PNG")],
+            ) as mock_chart,
+            patch("openai_monitor.send_telegram_media_group", return_value=True),
+        ):
+            openai_monitor.send_status_report()
+        self.assertEqual(mock_chart.call_args.kwargs["daily_costs"], zero_daily)
 
     def test_warning_emoji_when_forecast_low(self):
         self.write_state({"total_deposited": 150, "alert_threshold": 100})
@@ -777,13 +830,16 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
             patches[3],
             patches[4],
             patches[5],
-            patch("charts.build_status_chart", return_value=b"\x89PNG"),
             patch(
-                "openai_monitor.send_telegram_photo", return_value=True
-            ) as mock_photo,
+                "charts.build_status_charts",
+                return_value=[("daily.png", b"\x89PNG"), ("balance.png", b"\x89PNG")],
+            ),
+            patch(
+                "openai_monitor.send_telegram_media_group", return_value=True
+            ) as mock_album,
         ):
             openai_monitor.send_status_report()
-        caption = mock_photo.call_args.kwargs["caption"]
+        caption = mock_album.call_args.kwargs["caption"]
         self.assertIn("⚠️", caption)
         self.assertIn("3 дн", caption)
 
@@ -811,8 +867,11 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
             patches[3],
             patches[4],
             patches[5],
-            patch("charts.build_status_chart", return_value=b"\x89PNG"),
-            patch("openai_monitor.send_telegram_photo", return_value=False),
+            patch(
+                "charts.build_status_charts",
+                return_value=[("daily.png", b"\x89PNG"), ("balance.png", b"\x89PNG")],
+            ),
+            patch("openai_monitor.send_telegram_media_group", return_value=False),
             patch("openai_monitor.send_telegram_alert", return_value=False),
         ):
             with self.assertRaises(SystemExit) as cm:
@@ -825,15 +884,15 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
         self.write_state({"total_deposited": 7058.71, "alert_threshold": 200})
         with (
             patch("openai_monitor.get_total_costs", return_value=(None, "HTTP 500")),
-            patch("openai_monitor.get_today_costs", return_value=0.0),
+            patch("openai_monitor.get_yesterday_costs", return_value=0.0),
             patch("openai_monitor.get_billing_balance", return_value=None),
-            patch("openai_monitor.send_telegram_photo") as mock_photo,
+            patch("openai_monitor.send_telegram_media_group") as mock_album,
             patch(
                 "openai_monitor.send_telegram_alert", return_value=True
             ) as mock_alert,
         ):
             openai_monitor.send_status_report()
-        mock_photo.assert_not_called()
+        mock_album.assert_not_called()
         mock_alert.assert_called_once()
         msg = mock_alert.call_args.args[0]
         self.assertIn("Не удалось", msg)
@@ -857,19 +916,22 @@ class SendStatusReportTests(StateIsolationMixin, unittest.TestCase):
         )
         with (
             patch("openai_monitor.get_total_costs", return_value=(None, "HTTP 500")),
-            patch("openai_monitor.get_today_costs", return_value=0.0),
+            patch("openai_monitor.get_yesterday_costs", return_value=0.0),
             patch("openai_monitor.get_billing_balance", return_value=None),
             patch("openai_monitor.forecast_days_remaining", return_value=50),
             patch("openai_monitor.get_daily_costs", return_value=[]),
             patch("openai_monitor.get_month_line_item_costs", return_value=[]),
-            patch("charts.build_status_chart", return_value=b"\x89PNG"),
             patch(
-                "openai_monitor.send_telegram_photo", return_value=True
-            ) as mock_photo,
+                "charts.build_status_charts",
+                return_value=[("daily.png", b"\x89PNG"), ("balance.png", b"\x89PNG")],
+            ),
+            patch(
+                "openai_monitor.send_telegram_media_group", return_value=True
+            ) as mock_album,
         ):
             openai_monitor.send_status_report()
-        mock_photo.assert_called_once()
-        caption = mock_photo.call_args.kwargs["caption"]
+        mock_album.assert_called_once()
+        caption = mock_album.call_args.kwargs["caption"]
         self.assertIn("6558.71", caption)  # 7058.71 - 500 из кэша
         self.assertIn("кэш", caption)
         self.assertIn("HTTP 500", caption)

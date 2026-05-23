@@ -118,6 +118,38 @@ class BuildStatusChartSmokeTests(unittest.TestCase):
         )
         self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
 
+    def test_build_status_charts_returns_three_named_pngs(self):
+        today = date.today()
+        daily = [(today - timedelta(days=2 - i), 5 + i) for i in range(3)]
+        out = charts.build_status_charts(
+            daily_costs=daily,
+            topup_events=[(today - timedelta(days=1), 100)],
+            line_item_costs=[("gpt-5.2-2025-12-11, input", 10)],
+            current_balance=50,
+            alert_threshold=20,
+            forecast_days=5,
+        )
+        self.assertEqual(
+            [name for name, _ in out],
+            ["daily-spend.png", "balance.png", "model-spend.png"],
+        )
+        for _, png in out:
+            self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_build_selectel_balance_chart_returns_png(self):
+        today = date.today()
+        history = [
+            {"ts": (today - timedelta(days=2)).isoformat(), "balance": 120000},
+            {"ts": (today - timedelta(days=1)).isoformat(), "balance": 115000},
+            {"ts": today.isoformat(), "balance": 112851.66},
+        ]
+        png = charts.build_selectel_balance_chart(
+            history=history,
+            threshold=80000,
+            currency="RUB",
+        )
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+
 
 if __name__ == "__main__":
     unittest.main()
